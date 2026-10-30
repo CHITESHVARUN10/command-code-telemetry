@@ -1,0 +1,21 @@
+{
+  "name": "command-code-session-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Command Code mod: live model/context footer plus ACP-friendly /tokens, /con and /com commands",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "command-code",
+    "mod",
+    "acp",
+    "context",
+    "tokens"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types session-monitor.test.mjs"
+  }
+}
