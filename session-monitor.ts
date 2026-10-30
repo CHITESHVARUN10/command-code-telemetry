@@ -275,6 +275,42 @@ const EFFORT_COLOR: Record<string, string> = {
 
 const TOTAL_ENTRY = 'session-monitor/totals';
 
+/* ------------------------------------------------------------------ plan gate */
+
+/** Command Code's plan directory; tests override it through __test.setPlansDir. */
+let plansDir = path.join(os.homedir(), '.commandcode', 'plans');
+
+function resolvePlanPath(rawPath: string, cwd: string): string | undefined {
+	const expanded =
+		rawPath === '~' ? os.homedir() : rawPath.startsWith('~/') ? path.join(os.homedir(), rawPath.slice(2)) : rawPath;
+	let resolved = path.resolve(cwd, expanded);
+	try {
+		resolved = fs.realpathSync(resolved);
+	} catch {
+		/* the plan may have been removed already */
+	}
+	let dir = plansDir;
+	try {
+		dir = fs.realpathSync(dir);
+	} catch {
+		dir = path.resolve(dir);
+	}
+	const win = process.platform === 'win32';
+	const candidate = win ? resolved.toLowerCase() : resolved;
+	const base = win ? dir.toLowerCase() : dir;
+	if (candidate === base || !candidate.startsWith(`${base}${path.sep}`)) return undefined;
+	return candidate.toLowerCase().endsWith('.md') ? resolved : undefined;
+}
+
+function readPlanText(file: string): string | undefined {
+	try {
+		const text = fs.readFileSync(file, 'utf8');
+		return text.trim() ? text : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /* ------------------------------------------------------------------ speed */
 
 /** The CLI's own char->token estimator is Math.ceil(chars / 4); live TPS uses the same basis. */
@@ -287,7 +323,15 @@ const MAX_TPS = 5000;
 const LIVE_PAINT_MS = 400;
 
 /** Test seams — not part of the mod surface. */
-export const __test = {catalog, hydrate: hydrateCatalog, scan: scanModelCatalog, STATIC_CATALOG};
+export const __test = {
+	catalog,
+	hydrate: hydrateCatalog,
+	scan: scanModelCatalog,
+	STATIC_CATALOG,
+	setPlansDir: (dir: string) => {
+		plansDir = dir;
+	},
+};
 
 type Usage = {
 	inputTokens: number;
@@ -318,6 +362,11 @@ export default function sessionMonitor(cmd: ModApi): void {
 	let lastLivePaintAt = 0;
 	let genMs = 0;
 	let genTokens = 0;
+	// Plan gate: track the live mode, reviewed plans, and whether the user stopped after review.
+	let permissionMode: string | undefined;
+	const gatedPlans = new Set<string>();
+	let explicitPlanReview = false;
+	let planStopped = false;
 
 	/* ---------- formatting ---------- */
 	const shortModel = (id: string): string => {
@@ -734,6 +783,12 @@ export default function sessionMonitor(cmd: ModApi): void {
 		description: 'Show token counts next to the context percentage in the footer',
 	});
 
+	cmd.addFlag('planGate', {
+		type: 'boolean',
+		default: true,
+		description: 'Show plan files and ask approve/stop before implementing when the built-in plan review cannot',
+	});
+
 	cmd.hooks({
 		onSessionStart: safe(() => {
 			resetCounters();
@@ -742,6 +797,10 @@ export default function sessionMonitor(cmd: ModApi): void {
 			effortSetAt = 0;
 			ctxTokens = undefined;
 			subagents = 0;
+			permissionMode = undefined;
+			gatedPlans.clear();
+			explicitPlanReview = false;
+			planStopped = false;
 			seedFromSession();
 			model = model ?? configuredModel();
 			refreshEffort();
@@ -758,6 +817,85 @@ export default function sessionMonitor(cmd: ModApi): void {
 		onRunEnd: safe(() => {
 			persist();
 		}),
+		/**
+		 * The built-in plan review only runs in `default`/`plan` mode, and ACP drops the
+		 * plan text from review questions. When a plan file is written in any other mode,
+		 * show it and ask before the model starts implementing.
+		 */
+		beforeToolCall: (payload: unknown) => {
+			try {
+				if (!planStopped) return undefined;
+				const event = asRecord(payload);
+				const toolName = typeof event.toolName === 'string' ? event.toolName : '';
+				if (toolName !== 'write_file' && toolName !== 'edit_file' && toolName !== 'shell_command') return undefined;
+				const input = asRecord(event.input);
+				const rawPath = typeof input.file_path === 'string' ? input.file_path : '';
+				// Further plan edits are allowed; implementation is not.
+				if (rawPath && resolvePlanPath(rawPath, cmd.cwd ?? process.cwd())) return undefined;
+				return {
+					block: true,
+					terminate: true,
+					additionalContext:
+						'The user stopped the run after reviewing the plan. Do not implement; wait for their direction.',
+				};
+			} catch {
+				return undefined;
+			}
+		},
+		afterToolCall: async (payload: unknown) => {
+			try {
+				const event = asRecord(payload);
+				const toolName = typeof event.toolName === 'string' ? event.toolName : '';
+				if (event.isError === true || subagents > 0) return undefined;
+				if (toolName === 'exit_plan_mode' || toolName === 'plan_review') {
+					explicitPlanReview = true;
+					return undefined;
+				}
+				if (toolName !== 'write_file' && toolName !== 'edit_file') return undefined;
+				if (cmd.getFlag('planGate') === false || explicitPlanReview) return undefined;
+				const input = asRecord(event.input);
+				const rawPath = typeof input.file_path === 'string' ? input.file_path : '';
+				if (!rawPath) return undefined;
+				const planPath = resolvePlanPath(rawPath, cmd.cwd ?? process.cwd());
+				if (!planPath || gatedPlans.has(planPath)) return undefined;
+				gatedPlans.add(planPath);
+				const content = readPlanText(planPath);
+				const body = content ?? '(could not read the plan file)';
+				const clipped =
+					body.length > 16000 ? `${body.slice(0, 16000)}\n\n… truncated; open the file for the full plan.` : body;
+				try {
+					cmd.ui?.notify?.(`Plan written to ${planPath}:\n\n${clipped}`, 'warning');
+				} catch {
+					/* notices are best-effort */
+				}
+				// The built-in plan review already asks at stop in these modes.
+				if (permissionMode === 'default' || permissionMode === 'plan') return undefined;
+				if (typeof cmd.ui?.select !== 'function') return undefined;
+				const choice = await cmd.ui.select({
+					title: 'Plan ready — approve implementation?',
+					options: [
+						{label: 'Approve — implement this plan', description: 'Continue and make the changes.'},
+						{label: 'Stop — I want to review the plan', description: 'End the run so you can read or revise the plan.'},
+					],
+				});
+				if (choice === 'Stop — I want to review the plan') {
+					planStopped = true;
+					return {
+						terminate: true,
+						additionalContext:
+							'The user stopped the run after reviewing the plan. Do not implement; wait for their direction.',
+					};
+				}
+				if (choice === 'Approve — implement this plan') {
+					return {
+						additionalContext: 'The user reviewed and approved the plan. Implement it now, following the plan.',
+					};
+				}
+				return undefined;
+			} catch {
+				return undefined;
+			}
+		},
 	});
 
 	cmd.on(
@@ -865,6 +1003,23 @@ export default function sessionMonitor(cmd: ModApi): void {
 				}
 				pushStatus();
 			}
+		}),
+	);
+
+	cmd.on(
+		'permission_mode_changed',
+		safe((event: unknown) => {
+			const mode = asRecord(event).mode;
+			if (typeof mode === 'string' && mode) permissionMode = mode;
+		}),
+	);
+
+	cmd.on(
+		'run_start',
+		safe(() => {
+			gatedPlans.clear();
+			explicitPlanReview = false;
+			planStopped = false;
 		}),
 	);
 

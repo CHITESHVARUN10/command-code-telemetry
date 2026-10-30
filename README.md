@@ -1,4 +1,6 @@
-# command-code-session-monitor
+# command-code-telemetry
+
+[![Tests](https://github.com/CHITESHVARUN10/command-code-telemetry/actions/workflows/test.yml/badge.svg)](https://github.com/CHITESHVARUN10/command-code-telemetry/actions/workflows/test.yml)
 
 Live model, context, speed, and cache telemetry for [Command Code](https://commandcode.ai) — plus `/tokens`, `/con`, and `/com` commands that work in the terminal **and over ACP**.
 
@@ -21,7 +23,8 @@ All three return plain text, so they behave the same in the TUI and in any ACP c
 - **Live footer**: current model, reasoning effort, and context-window usage as a percentage with used/limit tokens. Turns yellow at ≥ 80% and red at ≥ 90%.
 - **Live TPS**: while a response streams, `tps ~87` is a live estimate (streamed characters ÷ 4, matching the CLI's own estimator, over the time since the first streamed token). When the response completes it is replaced by the exact rate (`tps 87`).
 - **Prompt-cache hit rate**: `cache-hit 87%` is the share of the latest request's input tokens served from cache. It appears only once the provider reports cache activity, so non-caching providers stay clean.
-- **ACP-friendly commands**: `/con` and `/com` return plain text and are resolved by the mod host before the prompt reaches the model.
+- **ACP-friendly commands**: `/con` and `/com` are advertised to ACP clients and resolved by the mod host before the prompt reaches the model.
+- **Plan guardrail**: when a plan file is written and the built-in plan review will not run (for example in `bypass` mode, or over ACP where the review question loses the plan text), the mod posts the plan and asks Approve / Stop before implementation. Enabled by default; disable it with `--mod-option planGate=false`.
 - **Session token accounting**: `/tokens` reports input, output, cache read/write, requests, turns, context fill, speed, and cache-hit rates, including per-model totals when you switch models.
 - **Stays in sync while you work**: model/effort changes from `/model`, `/effort`, or any other surface update the footer immediately (or at the next request at the latest).
 - **Survives resume**: totals are persisted as mod-private entries in the session store, so `/tokens` still adds up after a session is resumed.
@@ -31,11 +34,19 @@ All three return plain text, so they behave the same in the TUI and in any ACP c
 
 Requires [Command Code](https://commandcode.ai) with mod support. The mod is a single file with no dependencies.
 
-Command Code loads user mods from `~/.commandcode/mods/`:
+Command Code loads user mods from `~/.commandcode/mods/`. Download the latest file straight there:
 
 ```sh
 mkdir -p ~/.commandcode/mods
-cp session-monitor.ts ~/.commandcode/mods/session-monitor.ts
+curl -fsSL https://raw.githubusercontent.com/CHITESHVARUN10/command-code-telemetry/master/session-monitor.ts \
+  -o ~/.commandcode/mods/session-monitor.ts
+```
+
+Or, from a local clone:
+
+```sh
+mkdir -p ~/.commandcode/mods
+cp session-monitor.ts ~/.commandcode/mods/
 ```
 
 Reload a running session with `/reload`, or start a new one.
@@ -52,13 +63,9 @@ Replace `~/.commandcode/mods/session-monitor.ts` with the latest version and run
 
 ### ACP clients
 
-Mod commands are not advertised in ACP's command list, so they will not appear in a client's slash-command autocomplete. Type the command as the first line of the prompt:
+All commands are advertised to ACP clients when a session starts, so `/tokens`, `/con`, and `/com` appear in the client's slash-command list. They are parsed and resolved by the mod host, return plain text, and end the turn without a model call.
 
-```
-/con
-```
-
-The command returns plain text and ends the turn; no model call is made. Send the command as a single text block — extra content blocks (attachments) prevent slash-command parsing.
+Send the command as a single text block. Extra content blocks (attachments) prevent slash-command parsing, so the text is treated as an ordinary prompt instead.
 
 ## Commands
 
@@ -116,6 +123,24 @@ Session tokens — claude-sonnet-5-5 · effort high
 | Option | Default | Effect |
 |---|---|---|
 | `--mod-option showTokens=false` | `true` | Footer shows only the context percentage, without the `(230.4k/1M)` detail. |
+| `--mod-option planGate=false` | `true` | Disable the plan guardrail (plan display + approve/stop prompt). |
+
+### Plan review over ACP
+
+Command Code's built-in plan review only runs in `default` and `plan` modes, and the ACP bridge
+sends its question without the plan text. The `planGate` guardrail fills that gap:
+
+- A plan file written under `~/.commandcode/plans/` is posted to the feed with a warning
+  notice — over ACP, warnings are the only notice level that reaches the client.
+- Outside `default`/`plan` mode, it then asks **Approve — implement this plan** or
+  **Stop — I want to review the plan**. Stop terminates the run and blocks same-batch
+  implementation calls, so the plan is not written straight into code.
+- In `default`/`plan` mode it only surfaces the plan; the built-in review owns the decision.
+
+This is a best-effort guardrail, not a replacement for the native panel: it cannot change the
+built-in review question, and dismissing/cancelling the prompt lets the run continue. The
+upstream fix (forwarding `planContent` / `planFilePath` / `exitPlanMode` through ACP) is
+described in [docs/upstream-plan-review.md](./docs/upstream-plan-review.md).
 
 ## How it works
 
@@ -138,7 +163,7 @@ Built against the documented [ModApi](https://commandcode.ai/docs/mods) only —
 npm test
 ```
 
-Runs the real mod factory against a stubbed ModApi: 16 checks covering registration, footer rendering, `/tokens`, `/con`, `/com`, reset, the subagent guard, malformed events, persistence + resume, and catalog scanning. The bundle-hydration check runs when a Command Code install is present and is skipped otherwise.
+Runs the real mod factory against a stubbed ModApi: 17 checks covering registration, footer rendering, `/tokens`, `/con`, `/com`, reset, the plan gate, the subagent guard, malformed events, persistence + resume, and catalog scanning. The bundle-hydration check runs when a Command Code install is present and is skipped otherwise.
 
 No dependencies. Node ≥ 22.6 is required only to run the TypeScript test directly via type stripping. CI runs the suite on Node 22 and 24.
 

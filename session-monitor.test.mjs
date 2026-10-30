@@ -3,6 +3,8 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // Point the mod's bundle hydration at a real CLI install when one is present, BEFORE importing,
 // so the runtime catalog extraction is exercised too.
@@ -23,12 +25,14 @@ function makeStub(sharedEntries = []) {
 	const commands = new Map();
 	const flags = new Map();
 	const statuses = [];
+	const notices = [];
 	const cmd = {
 		name: 'session-monitor',
 		cwd: process.cwd(),
 		events: {emit() {}, on() { return {dispose() {}}; }},
 		ui: {
-			notify() {},
+			notify(message, level) { notices.push({message, level}); },
+			select: async () => undefined,
 			setStatus(text) { statuses.push(text); return {dispose() {}}; },
 			capabilities: {status: true},
 			widget() { return {dispose() {}}; },
@@ -59,7 +63,7 @@ function makeStub(sharedEntries = []) {
 		async exec() { return {stdout: '', stderr: '', code: 0}; },
 		getAllTools: () => [], getActiveTools: () => [], setActiveTools() {},
 	};
-	return {cmd, handlers, hooks, commands, statuses, entries: sharedEntries};
+	return {cmd, handlers, hooks, commands, statuses, notices, entries: sharedEntries};
 }
 
 const emit = (stub, type, event) => stub.handlers.get(type)({type, ...event});
@@ -98,12 +102,14 @@ createSessionMonitor(stub.cmd);
 assert.ok(stub.commands.has('tokens'), 'registers /tokens');
 assert.ok(stub.commands.has('con'), 'registers /con');
 assert.ok(stub.commands.has('com'), 'registers /com');
-for (const event of ['model_request_start', 'model_request_end', 'turn_end', 'config_setting_changed', 'subagent_start', 'subagent_stop', 'text_delta', 'thinking_delta']) {
+for (const event of ['model_request_start', 'model_request_end', 'turn_end', 'config_setting_changed', 'permission_mode_changed', 'run_start', 'subagent_start', 'subagent_stop', 'text_delta', 'thinking_delta']) {
 	assert.ok(stub.handlers.has(event), `listens for ${event}`);
 }
 assert.equal(typeof stub.hooks.onSessionStart, 'function');
 assert.equal(typeof stub.hooks.onRunEnd, 'function');
 assert.equal(typeof stub.hooks.onSessionEnd, 'function');
+assert.equal(typeof stub.hooks.beforeToolCall, 'function');
+assert.equal(typeof stub.hooks.afterToolCall, 'function');
 ok('registers command, flag, hooks and events');
 
 /* ---------- 3. session start paints the footer ---------- */
@@ -334,6 +340,124 @@ ok('totals survive a session resume via custom entries');
 	compactStub.cmd.sessions = {compact: async () => {}};
 	assert.match((await com(compactStub)).message, /Compaction finished\./);
 	ok('/com compacts through the host and reports the result, failing gracefully');
+}
+
+/* ---------- 16. plan gate: show the plan and ask before implementing ---------- */
+{
+	const plans = fs.mkdtempSync(path.join(os.tmpdir(), 'session-monitor-plans-'));
+	__test.setPlansDir(plans);
+	try {
+		const planPath = path.join(plans, 'demo-plan.md');
+		fs.writeFileSync(planPath, '# Plan\n\n1. Do the thing.\n');
+
+		const stopStub = makeStub();
+		createSessionMonitor(stopStub.cmd);
+		stopStub.hooks.onSessionStart({source: 'startup'});
+		let selectArgs;
+		stopStub.cmd.ui.select = async (args) => {
+			selectArgs = args;
+			return 'Stop — I want to review the plan';
+		};
+		let gateResult = await stopStub.hooks.afterToolCall({
+			toolCallId: 't1',
+			toolName: 'write_file',
+			input: {file_path: planPath},
+			isError: false,
+			state: {},
+		});
+		assert.equal(gateResult?.terminate, true);
+		assert.match(gateResult?.additionalContext, /stopped the run/);
+		assert.equal(selectArgs.title, 'Plan ready — approve implementation?');
+		assert.ok(stopStub.notices.some((n) => /Plan written to/.test(n.message) && /Do the thing/.test(n.message)));
+		assert.equal(stopStub.notices.at(-1).level, 'warning');
+
+		// After Stop, same-batch implementation calls are blocked, but plan edits still work.
+		const outputPath = path.join(os.tmpdir(), 'session-monitor-output.txt');
+		assert.equal(
+			stopStub.hooks.beforeToolCall({toolName: 'write_file', input: {file_path: outputPath}})?.block,
+			true,
+		);
+		assert.equal(stopStub.hooks.beforeToolCall({toolName: 'write_file', input: {file_path: planPath}}), undefined);
+		emit(stopStub, 'run_start', {});
+		assert.equal(stopStub.hooks.beforeToolCall({toolName: 'write_file', input: {file_path: outputPath}}), undefined);
+
+		const approveStub = makeStub();
+		createSessionMonitor(approveStub.cmd);
+		approveStub.hooks.onSessionStart({source: 'startup'});
+		approveStub.cmd.ui.select = async () => 'Approve — implement this plan';
+		gateResult = await approveStub.hooks.afterToolCall({toolName: 'write_file', input: {file_path: planPath}, isError: false});
+		assert.match(gateResult?.additionalContext, /approved the plan/);
+		assert.equal(gateResult?.terminate, undefined);
+		assert.equal(
+			approveStub.hooks.beforeToolCall({toolName: 'write_file', input: {file_path: outputPath}}),
+			undefined,
+		);
+
+		// The built-in review owns the decision in default/plan mode; only surface the plan.
+		const planModeStub = makeStub();
+		createSessionMonitor(planModeStub.cmd);
+		planModeStub.hooks.onSessionStart({source: 'startup'});
+		emit(planModeStub, 'permission_mode_changed', {mode: 'plan'});
+		let asked = false;
+		planModeStub.cmd.ui.select = async () => {
+			asked = true;
+			return 'Approve — implement this plan';
+		};
+		gateResult = await planModeStub.hooks.afterToolCall({toolName: 'write_file', input: {file_path: planPath}, isError: false});
+		assert.equal(gateResult, undefined);
+		assert.equal(asked, false);
+		assert.ok(planModeStub.notices.length > 0);
+
+		// Non-plan files and a disabled flag are ignored.
+		const notesPath = path.join(plans, 'notes.txt');
+		fs.writeFileSync(notesPath, 'hello');
+		const quietStub = makeStub();
+		createSessionMonitor(quietStub.cmd);
+		quietStub.hooks.onSessionStart({source: 'startup'});
+		quietStub.cmd.ui.select = async () => {
+			throw new Error('should not ask');
+		};
+		assert.equal(
+			await quietStub.hooks.afterToolCall({toolName: 'write_file', input: {file_path: notesPath}, isError: false}),
+			undefined,
+		);
+		assert.equal(quietStub.notices.length, 0);
+
+		const offStub = makeStub();
+		createSessionMonitor(offStub.cmd);
+		offStub.hooks.onSessionStart({source: 'startup'});
+		offStub.cmd.getFlag = (name) => (name === 'planGate' ? false : true);
+		assert.equal(
+			await offStub.hooks.afterToolCall({toolName: 'write_file', input: {file_path: planPath}, isError: false}),
+			undefined,
+		);
+		assert.equal(offStub.notices.length, 0);
+
+		// An explicit review tool, a failed write, and junk payloads never gate or throw.
+		const explicitStub = makeStub();
+		createSessionMonitor(explicitStub.cmd);
+		explicitStub.hooks.onSessionStart({source: 'startup'});
+		await explicitStub.hooks.afterToolCall({toolName: 'plan_review', input: {}, isError: false});
+		explicitStub.cmd.ui.select = async () => {
+			throw new Error('should not ask');
+		};
+		assert.equal(
+			await explicitStub.hooks.afterToolCall({toolName: 'write_file', input: {file_path: planPath}, isError: false}),
+			undefined,
+		);
+		assert.equal(await explicitStub.hooks.afterToolCall(undefined), undefined);
+		assert.equal(await explicitStub.hooks.afterToolCall({toolName: 'write_file', input: {}, isError: false}), undefined);
+		assert.equal(explicitStub.hooks.beforeToolCall(undefined), undefined);
+		assert.equal(explicitStub.hooks.beforeToolCall({toolName: 'write_file', input: {}}), undefined);
+		assert.equal(
+			await explicitStub.hooks.afterToolCall({toolName: 'write_file', input: {file_path: planPath}, isError: true}),
+			undefined,
+		);
+		ok('plan gate shows the plan and asks approve/stop outside default/plan modes');
+	} finally {
+		fs.rmSync(plans, {recursive: true, force: true});
+		__test.setPlansDir(path.join(os.homedir(), '.commandcode', 'plans'));
+	}
 }
 
 console.log(`\n✅ session-monitor: all ${checks} checks passed`);

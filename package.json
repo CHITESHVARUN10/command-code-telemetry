@@ -1,10 +1,14 @@
 {
-  "name": "command-code-session-monitor",
+  "name": "command-code-telemetry",
   "version": "1.0.0",
   "private": true,
   "description": "Command Code mod: live model/context footer plus ACP-friendly /tokens, /con and /com commands",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CHITESHVARUN10/command-code-telemetry.git"
+  },
   "keywords": [
     "command-code",
     "mod",
