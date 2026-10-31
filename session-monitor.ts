@@ -675,7 +675,7 @@ export default function sessionMonitor(cmd: ModApi): void {
 	};
 
 	/** The host's live reading (`cmd.getContextUsage`), validated field by field. */
-	const readLiveContext = (): {used?: number; limit?: number; percent?: number} => {
+	const readLiveContext = (): {used?: number; limit?: number; percent?: number; available?: boolean} => {
 		try {
 			const raw = typeof cmd.getContextUsage === 'function' ? cmd.getContextUsage() : undefined;
 			const record = asRecord(raw);
@@ -683,7 +683,7 @@ export default function sessionMonitor(cmd: ModApi): void {
 			const limit = asOptionalCount(record.contextWindow);
 			const percent = asOptionalCount(record.percent);
 			if (used !== undefined || limit !== undefined) {
-				return {used, limit, percent: percent !== undefined ? Math.min(100, percent) : undefined};
+				return {used, limit, percent: percent !== undefined ? Math.min(100, percent) : undefined, available: true};
 			}
 		} catch {
 			/* fall back to the event-derived reading below */
@@ -720,10 +720,10 @@ export default function sessionMonitor(cmd: ModApi): void {
 		const shownEffort = liveEffort(modelId);
 		const header = `Context — ${modelId ?? 'unknown model'}${shownEffort ? ` · effort ${shownEffort}` : ''}`;
 		const live = readLiveContext();
-		const used = live.used ?? ctxTokens;
+		const used = live.available ? live.used : ctxTokens;
 		const limit = live.limit ?? (modelId ? catalog.get(modelId)?.ctx : undefined);
 		if (used === undefined) {
-			return [header, '', '  No context measurement yet — it fills in after the first model request.'].join('\n');
+			return [header, '', '  No current context measurement available yet.'].join('\n');
 		}
 		const percent =
 			live.percent ??
@@ -731,6 +731,7 @@ export default function sessionMonitor(cmd: ModApi): void {
 		const row = (label: string, value: string): string => `  ${label.padEnd(8)}${value}`;
 		const lines: string[] = [header, ''];
 		lines.push(row('used', `${fmtInt(used)} tokens`));
+		lines.push(row('source', live.available ? 'host context estimate' : 'last model request (may be stale)'));
 		if (typeof limit === 'number' && limit > 0) {
 			lines.push(row('window', `${fmtInt(limit)} tokens`));
 			lines.push(row('free', `${fmtInt(Math.max(0, limit - used))} tokens (${Math.max(0, 100 - (percent ?? 0))}%)`));
@@ -757,7 +758,7 @@ export default function sessionMonitor(cmd: ModApi): void {
 		if (outcome) {
 			const detail = beforeTokens !== undefined && afterTokens !== undefined
 				? ` Estimated conversation tokens: ${fmtInt(beforeTokens)} → ${fmtInt(afterTokens)}.` : '';
-			return `Compaction outcome: ${String(outcome.outcome ?? 'unknown')}.${detail} /con may show the last model request until the next request.`;
+			return `Compaction outcome: ${String(outcome.outcome ?? 'unknown')}.${detail} /con shows the host’s current context estimate when available.`;
 		}
 		const before = asOptionalCount(record.messagesBefore);
 		const after = asOptionalCount(record.messagesAfter);
@@ -770,7 +771,7 @@ export default function sessionMonitor(cmd: ModApi): void {
 		} else if (counts) {
 			lines.push(`Compaction finished: no tokens freed · ${counts}.`);
 		} else {
-			return 'Compaction requested, but the host did not report an outcome. /con may show the last model request until the next request.';
+			return 'Compaction requested, but the host did not report an outcome. /con shows the host’s current context estimate when available.';
 		}
 		return lines.join('\n');
 	};

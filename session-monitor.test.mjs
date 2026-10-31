@@ -284,7 +284,7 @@ ok('totals survive a session resume via custom entries');
 	const ctxStub = makeStub();
 	createSessionMonitor(ctxStub.cmd);
 	ctxStub.hooks.onSessionStart({source: 'startup'});
-	assert.match(con(ctxStub).message, /No context measurement yet/);
+	assert.match(con(ctxStub).message, /No current context measurement/);
 
 	emit(ctxStub, 'model_request_start', {model: 'claude-sonnet-5-5'});
 	emit(ctxStub, 'model_request_end', {
@@ -297,6 +297,7 @@ ok('totals survive a session resume via custom entries');
 	assert.match(contextReport, /1,000,000 tokens/);
 	assert.match(contextReport, /769,600 tokens \(77%\)/);
 	assert.match(contextReport, /23%/);
+	assert.match(contextReport, /last model request \(may be stale\)/);
 
 	// The host's live reading wins over the last event-derived value.
 	ctxStub.cmd.getContextUsage = () => ({tokens: 640000, contextWindow: 1000000, percent: 64});
@@ -307,6 +308,12 @@ ok('totals survive a session resume via custom entries');
 	assert.match(contextReport, /640,000 tokens/);
 	assert.match(contextReport, /64%/);
 	assert.doesNotMatch(contextReport, /230,400/);
+	assert.match(contextReport, /host context estimate/);
+	ctxStub.cmd.getContextUsage = () => ({tokens: 12000, contextWindow: 1000000, percent: 1});
+	assert.match(con(ctxStub).message, /12,000 tokens/);
+	ctxStub.cmd.getContextUsage = () => ({tokens: null, contextWindow: 1000000, percent: null});
+	assert.match(con(ctxStub).message, /No current context measurement/);
+	assert.doesNotMatch(con(ctxStub).message, /230,400/);
 
 	// Unknown model: show the used count, no percentage.
 	const unknownStub = makeStub();

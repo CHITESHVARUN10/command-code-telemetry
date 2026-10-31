@@ -82,6 +82,7 @@ Send the command as a single text block. Extra content blocks (attachments) prev
 Context — claude-sonnet-5-5 · effort high
 
   used    230,400 tokens
+  source  host context estimate
   window  1,000,000 tokens
   free    769,600 tokens (77%)
   fill     23%  █████░░░░░░░░░░░░░░░
@@ -89,7 +90,7 @@ Context — claude-sonnet-5-5 · effort high
   /com compacts the conversation · /tokens shows session totals
 ```
 
-Reads `cmd.getContextUsage()` for a live reading and falls back to the last request's token count when the host does not expose it. Unknown/BYOK models still report their used tokens, without a percentage.
+Reads `cmd.getContextUsage()` for the host’s current estimate. When the host does not expose a reading, it labels the last request’s token count as potentially stale. Unknown/BYOK models still report their used tokens, without a percentage.
 
 ### `/com`
 
@@ -98,7 +99,7 @@ Compacted conversation: ~120,000 tokens freed · 40 → 9 messages.
 Context is now 14% full (140,000 / 1,000,000).
 ```
 
-Runs `cmd.sessions.compact()`. Depending on the host, the result may be unavailable; in that case the command reports that it could not verify the outcome. Context usage can reflect the last model request until a subsequent request updates it.
+Runs `cmd.sessions.compact()`. Depending on the host, the result may be unavailable; in that case the command reports that it could not verify the outcome. The host’s context usage is an estimate and can differ from the next provider-reported token count.
 
 ### `/tokens`
 
