@@ -72,7 +72,7 @@ Send the command as a single text block. Extra content blocks (attachments) prev
 | Command | What it does |
 |---|---|
 | `/con` | Live context usage: tokens used, window size, tokens free, fill percentage and a bar. |
-| `/com` | Compact the conversation and report tokens freed, message counts, and the new fill. |
+| `/com` | Request compaction and report the host outcome when available. |
 | `/tokens` | This session's input / output / cache totals, request and turn counts, context fill, speed, and cache-hit rates. |
 | `/tokens reset` | Zero the session counters. |
 
@@ -98,7 +98,7 @@ Compacted conversation: ~120,000 tokens freed · 40 → 9 messages.
 Context is now 14% full (140,000 / 1,000,000).
 ```
 
-Runs `cmd.sessions.compact()` — the same underlying compaction as the built-in `/compact` — and also refreshes the footer immediately instead of waiting for the next request.
+Runs `cmd.sessions.compact()`. Depending on the host, the result may be unavailable; in that case the command reports that it could not verify the outcome. Context usage can reflect the last model request until a subsequent request updates it.
 
 ### `/tokens`
 

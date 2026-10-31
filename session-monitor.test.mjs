@@ -332,13 +332,15 @@ ok('totals survive a session resume via custom entries');
 	let compacted = (await com(compactStub)).message;
 	assert.match(compacted, /120,000 tokens freed/);
 	assert.match(compacted, /40 → 9 messages/);
-	assert.match(compacted, /Context is now 14% full \(140,000 \/ 1,000,000\)\./);
+	assert.doesNotMatch(compacted, /Context is now/);
 
 	compactStub.cmd.sessions = {compact: async () => { throw new Error('boom'); }};
 	assert.match((await com(compactStub)).message, /compaction failed \(boom\)/);
 
 	compactStub.cmd.sessions = {compact: async () => {}};
-	assert.match((await com(compactStub)).message, /Compaction finished\./);
+	assert.match((await com(compactStub)).message, /host did not report an outcome/);
+	compactStub.cmd.sessions = {compact: async () => emit(compactStub, 'compaction_outcome', {trigger: 'manual', outcome: 'failed', tokensBefore: 500000, tokensAfter: 499000})};
+	assert.match((await com(compactStub)).message, /outcome: failed.*500,000 → 499,000/);
 	ok('/com compacts through the host and reports the result, failing gracefully');
 }
 

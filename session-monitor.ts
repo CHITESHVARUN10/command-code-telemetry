@@ -743,8 +743,22 @@ export default function sessionMonitor(cmd: ModApi): void {
 	};
 
 	/* ---------- /com: compaction result ---------- */
+	let manualCompaction: Record<string, unknown> | undefined;
+	let awaitingCompaction = false;
+	cmd.on('compaction_outcome', (event: unknown) => {
+		const outcome = asRecord(event);
+		if (awaitingCompaction && outcome.trigger === 'manual') manualCompaction = outcome;
+	});
 	const buildCompactionMessage = (result: unknown): string => {
 		const record = asRecord(result);
+		const outcome = manualCompaction;
+		const beforeTokens = asOptionalCount(outcome?.tokensBefore);
+		const afterTokens = asOptionalCount(outcome?.tokensAfter);
+		if (outcome) {
+			const detail = beforeTokens !== undefined && afterTokens !== undefined
+				? ` Estimated conversation tokens: ${fmtInt(beforeTokens)} → ${fmtInt(afterTokens)}.` : '';
+			return `Compaction outcome: ${String(outcome.outcome ?? 'unknown')}.${detail} /con may show the last model request until the next request.`;
+		}
 		const before = asOptionalCount(record.messagesBefore);
 		const after = asOptionalCount(record.messagesAfter);
 		const saved = asOptionalCount(record.tokensSaved);
@@ -756,22 +770,7 @@ export default function sessionMonitor(cmd: ModApi): void {
 		} else if (counts) {
 			lines.push(`Compaction finished: no tokens freed · ${counts}.`);
 		} else {
-			lines.push('Compaction finished.');
-		}
-		const live = readLiveContext();
-		const modelId = liveModel();
-		const limit = live.limit ?? (modelId ? catalog.get(modelId)?.ctx : undefined);
-		if (live.used !== undefined) {
-			const percent =
-				live.percent ??
-				(typeof limit === 'number' && limit > 0
-					? Math.max(0, Math.min(100, Math.round((live.used / limit) * 100)))
-					: undefined);
-			lines.push(
-				percent !== undefined && typeof limit === 'number' && limit > 0
-					? `Context is now ${percent}% full (${fmtInt(live.used)} / ${fmtInt(limit)}).`
-					: `Context is now ${fmtInt(live.used)} tokens.`,
-			);
+			return 'Compaction requested, but the host did not report an outcome. /con may show the last model request until the next request.';
 		}
 		return lines.join('\n');
 	};
@@ -1077,13 +1076,15 @@ export default function sessionMonitor(cmd: ModApi): void {
 				if (typeof compact !== 'function') {
 					return {message: 'session-monitor: this host does not expose session compaction to mods.'};
 				}
+				manualCompaction = undefined;
+				awaitingCompaction = true;
 				const result = await compact();
-				const after = readLiveContext();
-				if (after.used !== undefined) ctxTokens = after.used;
 				pushStatus();
 				return {message: buildCompactionMessage(result)};
 			} catch (error) {
 				return {message: `session-monitor: compaction failed (${error instanceof Error ? error.message : String(error)}).`};
+			} finally {
+				awaitingCompaction = false;
 			}
 		},
 	});
