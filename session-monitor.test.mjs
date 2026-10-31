@@ -347,7 +347,18 @@ ok('totals survive a session resume via custom entries');
 	compactStub.cmd.sessions = {compact: async () => {}};
 	assert.match((await com(compactStub)).message, /host did not report an outcome/);
 	compactStub.cmd.sessions = {compact: async () => emit(compactStub, 'compaction_outcome', {trigger: 'manual', outcome: 'failed', tokensBefore: 500000, tokensAfter: 499000})};
-	assert.match((await com(compactStub)).message, /outcome: failed.*500,000 → 499,000/);
+	compacted = (await com(compactStub)).message;
+	assert.match(compacted, /Compaction failed/);
+	assert.match(compacted, /500,000 → 499,000/);
+	compactStub.cmd.sessions = {compact: async () => emit(compactStub, 'compaction_outcome', {trigger: 'manual', outcome: 'summarized', tokensBefore: 154696, tokensAfter: 128320})};
+	compacted = (await com(compactStub)).message;
+	assert.match(compacted, /154,696 → 128,320/);
+	assert.match(compacted, /Host context reading: 140,000 → 140,000/);
+	assert.match(con(compactStub).message, /may include pre-compaction/);
+	emit(compactStub, 'model_request_end', {usage: {inputTokens: 10000}});
+	assert.doesNotMatch(con(compactStub).message, /may include pre-compaction/);
+	compactStub.cmd.sessions = {compact: async () => emit(compactStub, 'compaction_outcome', {trigger: 'manual', outcome: 'too-small', tokensBefore: 128320, tokensAfter: 130620})};
+	assert.match((await com(compactStub)).message, /No further summary was made/);
 	ok('/com compacts through the host and reports the result, failing gracefully');
 }
 

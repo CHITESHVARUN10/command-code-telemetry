@@ -1,0 +1,81 @@
+diff --git a/packages/provider-acp-registry/src/server/adapter.ts b/packages/provider-acp-registry/src/server/adapter.ts
+index 6c2b4a9f..fee6687b 100644
+--- a/packages/provider-acp-registry/src/server/adapter.ts
++++ b/packages/provider-acp-registry/src/server/adapter.ts
+@@ -1,3 +1,4 @@
++import { extractCommandCodeQuestion } from "./commandCodeQuestion.ts";
+ import {
+   extractClaudeSubagentUpdate,
+   extractClaudeSubagentSessionEvent,
+@@ -186,6 +187,8 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
+   const startupKey =
+     options.settings.source === "local" ? `local:${options.instanceId}` : registryAgentId;
+   const isDevin = registryAgentId === "devin";
++  const isCommandCode = registryAgentId === "command-code" ||
++    (options.settings.source === "local" && /(?:^|[\\/])(?:cmd|command-code)(?:\.exe|\.cmd)?$/i.test(options.settings.commandPath));
+   // Local installs launch the `copilot` binary directly with no registry id.
+   const isCopilot =
+     registryAgentId === "github-copilot-cli" ||
+@@ -210,6 +213,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
+   const copilotRouting = isCopilot ? makeCopilotSubagentRouting() : undefined;
+   const flavor: AcpAdapterV2Flavor = {
+     driver: ACP_REGISTRY_PROVIDER,
++    ...(isCommandCode ? { extractPermissionQuestion: extractCommandCodeQuestion } : {}),
+     // Cancelling a Copilot prompt also kills the background agents it started.
+     capabilities: isCopilot
+       ? {
+diff --git a/packages/provider-acp-registry/src/server/commandCodeQuestion.test.mjs b/packages/provider-acp-registry/src/server/commandCodeQuestion.test.mjs
+new file mode 100644
+index 00000000..d3730cf8
+--- /dev/null
++++ b/packages/provider-acp-registry/src/server/commandCodeQuestion.test.mjs
+@@ -0,0 +1,7 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {extractCommandCodeQuestion} from './commandCodeQuestion.ts';
++const make = (id='call_1') => ({sessionId:'s',toolCall:{toolCallId:id,kind:'other',rawInput:{question:'Which?',options:['A (Recommended)','B','C']}}, options:['A (Recommended)','B','C'].map((name,i)=>({optionId:`option_${i}`,kind:'allow_once',name:`${name}: Description ${i}`}))});
++test('explicit choice B and recommendation do not select first',()=>{const q=extractCommandCodeQuestion(make());assert.equal(q.question.allowCustomAnswer,false);assert.equal(q.question.options[1].description,'Description 1');assert.deepEqual(q.respond({call_1:'option_1'}),{outcome:{outcome:'selected',optionId:'option_1'}});assert.deepEqual(q.respond({call_1:'option_2'}),{outcome:{outcome:'selected',optionId:'option_2'}})});
++test('missing, wrong, or multiple selections do not select an option',()=>{const q=extractCommandCodeQuestion(make());for(const answers of [{},{call_1:'other'},{call_1:['option_1','option_2']},{call_2:'option_1'}])assert.equal(q.respond(answers),undefined)});
++test('requests remain isolated and non-question permissions are ignored',()=>{const a=extractCommandCodeQuestion(make('a')),b=extractCommandCodeQuestion(make('b'));assert.equal(b.respond({a:'option_1'}),undefined);assert.equal(a.respond({b:'option_2'}),undefined);let r=make();r.toolCall.rawInput={command:'ls'};assert.equal(extractCommandCodeQuestion(r),undefined)});
+diff --git a/packages/provider-acp-registry/src/server/commandCodeQuestion.ts b/packages/provider-acp-registry/src/server/commandCodeQuestion.ts
+new file mode 100644
+index 00000000..9fcda5fd
+--- /dev/null
++++ b/packages/provider-acp-registry/src/server/commandCodeQuestion.ts
+@@ -0,0 +1,36 @@
++import type * as Acp from "effect-acp/compat";
++import type { ProviderUserInputAnswers, UserInputQuestion } from "@t3tools/contracts";
++
++/** Command Code's ACP question transport encodes one answer as a permission option. */
++export function extractCommandCodeQuestion(request: Acp.RequestPermissionRequest): {
++  question: UserInputQuestion;
++  respond: (answers: ProviderUserInputAnswers) => Acp.RequestPermissionResponse | undefined;
++} | undefined {
++  const raw = request.toolCall.rawInput;
++  if (request.toolCall.kind !== "other" || !raw || typeof raw !== "object" || Array.isArray(raw)) return;
++  const input = raw as Record<string, unknown>;
++  if (typeof input.question !== "string" || !input.question.trim() || !Array.isArray(input.options)) return;
++  const labels = input.options;
++  if (labels.length < 2 || labels.length > 4 || labels.length !== request.options.length ||
++      labels.some((label) => typeof label !== "string" || !label.trim()) ||
++      new Set(labels).size !== labels.length ||
++      request.options.some((option, index) => option.kind !== "allow_once" || option.optionId !== `option_${index}` ||
++        !(option.name === labels[index] || option.name.startsWith(`${labels[index]}: `)))) return;
++  const id = request.toolCall.toolCallId;
++  const question: UserInputQuestion = {
++    id, header: "Question", question: input.question, multiSelect: false, allowCustomAnswer: false,
++    options: request.options.map((option, index) => ({
++      value: option.optionId,
++      label: labels[index] as string,
++      description: option.name === labels[index] ? "" : option.name.slice((labels[index] as string).length + 2),
++    })),
++  };
++  return {
++    question,
++    respond: (answers) => {
++      const value = answers[id];
++      if (typeof value !== "string" || !request.options.some((option) => option.optionId === value)) return undefined;
++      return { outcome: { outcome: "selected", optionId: value } };
++    },
++  };
++}

@@ -8,6 +8,17 @@ Live model, context, speed, and cache telemetry for [Command Code](https://comma
 ⬡ claude-sonnet-5-5 · effort high · ctx 23% (230.4k/1M) · tps ~87 · cache-hit 87%
 ```
 
+## Two components
+
+This repository contains two independent components that can be used together:
+
+- **Session monitor mod** ([session-monitor.ts](./session-monitor.ts)) loads inside Command Code. It provides telemetry, `/tokens`, `/con`, `/com`, and a best-effort plan review guardrail in terminal and ACP sessions.
+- **ACP bridge** ([acp-question-bridge/bridge.mjs](./acp-question-bridge/bridge.mjs)) runs between an ACP client such as T3 Code and Command Code. It starts the real `cmd acp` process and forwards its ACP messages in both directions, with targeted changes described below. It does not replace the Command Code harness or require the session monitor mod.
+
+The bridge forwards ordinary ACP traffic, including normal prompts, tool calls, session messages and permission requests. It translates recognized single-choice questions into ACP forms so a compatible client can show an interactive question; it provides a text `/context` reading from host usage updates; and it translates `/cccompact` into Command Code's native `/compact`. Other ACP clients may render these interactions differently. These are intended pass-through semantics, not a guarantee that every ACP feature or every client combination has been tested.
+
+There are limits: the question bridge cannot return multi-select or arbitrary custom text through Command Code's current question transport; cancellation may still lead the model to proceed with an assumption. `/context` uses the last ACP host reading, which can be an estimate and is **not** the terminal's detailed `/context` analysis. T3 currently intercepts `/compact` before the generic ACP provider receives it, so use `/cccompact` in a bridge session. See [bridge documentation](./acp-question-bridge/README.md) and [ACP capability research](./docs/acp-capability-research.md).
+
 ## Why this exists
 
 Command Code's built-in `/context` is a terminal-UI overlay. When Command Code runs behind an ACP client (Zed, T3 Code, …), that overlay is not part of the ACP command surface — a command the ACP layer does not resolve falls through to the model as ordinary prompt text. This mod publishes the same kind of information as plain-text slash commands, and keeps a live status line in the footer for terminal use.
@@ -30,7 +41,7 @@ All three return plain text, so they behave the same in the TUI and in any ACP c
 - **Survives resume**: totals are persisted as mod-private entries in the session store, so `/tokens` still adds up after a session is resumed.
 - **Defensive by design**: every handler is wrapped, malformed event payloads are ignored, and unknown models degrade to raw token counts instead of failing.
 
-## Install
+## Install the session monitor mod
 
 Requires [Command Code](https://commandcode.ai) with mod support. The mod is a single file with no dependencies.
 
@@ -56,6 +67,20 @@ To try it without installing:
 ```sh
 cmd --mod ./session-monitor.ts
 ```
+
+### Install the ACP bridge for T3 Code
+
+The bridge is separate from the mod. With Node.js available on the executable search path and Command Code installed at `/usr/local/bin/cmd`, copy the bridge to a stable location:
+
+```sh
+mkdir -p ~/.commandcode/acp-question-bridge
+cp acp-question-bridge/bridge.mjs ~/.commandcode/acp-question-bridge/bridge.mjs
+chmod +x ~/.commandcode/acp-question-bridge/bridge.mjs
+```
+
+In T3 Code, add a separate **local ACP provider** whose executable is the absolute path to that file, with no arguments. Select that provider for new sessions. The existing Command Code ACP provider can remain configured. The bridge launches `/usr/local/bin/cmd acp`; set `COMMAND_CODE_BINARY` for a different executable path. Restart a bridge session after updating the file.
+
+To uninstall, remove the bridge provider from T3 settings and remove `~/.commandcode/acp-question-bridge/`. Remove the mod separately only if desired.
 
 ### Updating
 
@@ -95,11 +120,12 @@ Reads `cmd.getContextUsage()` for the host’s current estimate. When the host d
 ### `/com`
 
 ```text
-Compacted conversation: ~120,000 tokens freed · 40 → 9 messages.
-Context is now 14% full (140,000 / 1,000,000).
+Conversation summarized.
+Estimated conversation messages: 154,696 → 128,320 tokens.
+Host context reading: 180,505 → 180,505 tokens.
 ```
 
-Runs `cmd.sessions.compact()`. Depending on the host, the result may be unavailable; in that case the command reports that it could not verify the outcome. The host’s context usage is an estimate and can differ from the next provider-reported token count.
+Runs Command Code's native `cmd.sessions.compact()`. The message estimate and host context reading use different accounting; the latter may retain pre-compaction usage until a subsequent model request. A `too-small` outcome means the host did not find enough older messages to summarize. Command Code decides how much recent conversation to retain. If the host does not report an outcome, `/com` says it could not verify the result.
 
 ### `/tokens`
 
@@ -162,13 +188,14 @@ Built against the documented [ModApi](https://commandcode.ai/docs/mods) only —
 
 ```sh
 npm test
+node --test acp-question-bridge/bridge.test.mjs
 ```
 
 Runs the real mod factory against a stubbed ModApi: 17 checks covering registration, footer rendering, `/tokens`, `/con`, `/com`, reset, the plan gate, the subagent guard, malformed events, persistence + resume, and catalog scanning. The bundle-hydration check runs when a Command Code install is present and is skipped otherwise.
 
-No dependencies. Node ≥ 22.6 is required only to run the TypeScript test directly via type stripping. CI runs the suite on Node 22 and 24.
+No npm dependencies. The bridge needs Node.js; Node ≥ 22.6 is required for the TypeScript test via type stripping. CI runs the suite on Node 22 and 24.
 
-## Uninstall
+## Uninstall the mod
 
 ```sh
 rm ~/.commandcode/mods/session-monitor.ts

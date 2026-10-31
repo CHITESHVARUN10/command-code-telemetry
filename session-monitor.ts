@@ -732,6 +732,7 @@ export default function sessionMonitor(cmd: ModApi): void {
 		const lines: string[] = [header, ''];
 		lines.push(row('used', `${fmtInt(used)} tokens`));
 		lines.push(row('source', live.available ? 'host context estimate' : 'last model request (may be stale)'));
+		if (contextAfterCompaction) lines.push('  Note: this host reading may include pre-compaction usage until the next model request.');
 		if (typeof limit === 'number' && limit > 0) {
 			lines.push(row('window', `${fmtInt(limit)} tokens`));
 			lines.push(row('free', `${fmtInt(Math.max(0, limit - used))} tokens (${Math.max(0, 100 - (percent ?? 0))}%)`));
@@ -746,19 +747,31 @@ export default function sessionMonitor(cmd: ModApi): void {
 	/* ---------- /com: compaction result ---------- */
 	let manualCompaction: Record<string, unknown> | undefined;
 	let awaitingCompaction = false;
+	let contextAfterCompaction = false;
 	cmd.on('compaction_outcome', (event: unknown) => {
 		const outcome = asRecord(event);
+		if (outcome.outcome === 'summarized') contextAfterCompaction = true;
 		if (awaitingCompaction && outcome.trigger === 'manual') manualCompaction = outcome;
 	});
-	const buildCompactionMessage = (result: unknown): string => {
+	const buildCompactionMessage = (result: unknown, contextBefore?: number): string => {
 		const record = asRecord(result);
 		const outcome = manualCompaction;
 		const beforeTokens = asOptionalCount(outcome?.tokensBefore);
 		const afterTokens = asOptionalCount(outcome?.tokensAfter);
 		if (outcome) {
-			const detail = beforeTokens !== undefined && afterTokens !== undefined
-				? ` Estimated conversation tokens: ${fmtInt(beforeTokens)} → ${fmtInt(afterTokens)}.` : '';
-			return `Compaction outcome: ${String(outcome.outcome ?? 'unknown')}.${detail} /con shows the host’s current context estimate when available.`;
+			const status = outcome.outcome === 'summarized' ? 'Conversation summarized.'
+				: outcome.outcome === 'too-small' ? 'No further summary was made: not enough older messages to summarize.'
+				: outcome.outcome === 'failed' ? 'Compaction failed: the host could not produce a summary.'
+				: `Compaction outcome: ${String(outcome.outcome ?? 'unknown')}.`;
+			const lines = [status];
+			if (beforeTokens !== undefined && afterTokens !== undefined)
+				lines.push(`Estimated conversation messages: ${fmtInt(beforeTokens)} → ${fmtInt(afterTokens)} tokens.`);
+			const afterContext = readLiveContext().used;
+			if (contextBefore !== undefined && afterContext !== undefined)
+				lines.push(`Host context reading: ${fmtInt(contextBefore)} → ${fmtInt(afterContext)} tokens.`);
+			else if (afterContext !== undefined) lines.push(`Host context reading: ${fmtInt(afterContext)} tokens.`);
+			lines.push('These use different accounting. The host reading may retain pre-compaction usage until the next model request; message estimates exclude other context.');
+			return lines.join('\n');
 		}
 		const before = asOptionalCount(record.messagesBefore);
 		const after = asOptionalCount(record.messagesAfter);
@@ -923,7 +936,10 @@ export default function sessionMonitor(cmd: ModApi): void {
 			const requestModel = typeof record.model === 'string' && record.model ? record.model : model;
 			accumulate(requestModel, usage);
 			if (requestModel) model = requestModel;
-			if (subagents === 0 && usage.inputTokens > 0) ctxTokens = usage.inputTokens;
+			if (subagents === 0 && usage.inputTokens > 0) {
+				ctxTokens = usage.inputTokens;
+				contextAfterCompaction = false;
+			}
 			if (subagents === 0) {
 				if (usage.outputTokens > 0) {
 					const anchor = streamStartedAt ?? requestStartedAt;
@@ -1078,10 +1094,11 @@ export default function sessionMonitor(cmd: ModApi): void {
 					return {message: 'session-monitor: this host does not expose session compaction to mods.'};
 				}
 				manualCompaction = undefined;
+				const contextBefore = readLiveContext().used;
 				awaitingCompaction = true;
 				const result = await compact();
 				pushStatus();
-				return {message: buildCompactionMessage(result)};
+				return {message: buildCompactionMessage(result, contextBefore)};
 			} catch (error) {
 				return {message: `session-monitor: compaction failed (${error instanceof Error ? error.message : String(error)}).`};
 			} finally {
