@@ -8,7 +8,7 @@ import {homedir} from 'node:os';
 import {join, dirname, resolve, relative, isAbsolute} from 'node:path';
 
 const executable = process.env.COMMAND_CODE_BINARY || '/usr/local/bin/cmd';
-const VERSION = '2.0.0';
+const VERSION = '2.0.1';
 const numberOption = (key, fallback) => {
   const value = Number(process.env[key]);
   return Number.isFinite(value) && value >= 0 && process.env[key] !== '' ? value : fallback;
@@ -82,11 +82,35 @@ function fail(reason) {
 }
 function parse(line, direction) {
   if (!line.trim()) return null;
+  const fromClient = direction === 'ACP client';
+  let value;
   try {
-    const value = JSON.parse(line);
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid object');
-    return value;
-  } catch { fail(`Invalid JSON-RPC from ${direction}; the connection was closed instead of dropping a message.`); return null; }
+    value = JSON.parse(line);
+  } catch {
+    if (fromClient) clientProtocolError(-32700, 'Parse error: invalid JSON', 'invalid_json', line.length);
+    else fail('Invalid JSON-RPC from Command Code; the connection was closed instead of dropping a message.');
+    return null;
+  }
+  if (!fromClient && (!value || typeof value !== 'object' || Array.isArray(value))) {
+    fail('Invalid JSON-RPC from Command Code; expected an object.');
+    return null;
+  }
+  // T3's Effect JSON-RPC codec can encode batches. Expand them into individual
+  // frames because Command Code accepts only one object per line.
+  if (fromClient) return {messages:Array.isArray(value) && value.length ? value : [value]};
+  return value;
+}
+function clientProtocolError(code, message, category, chars) {
+  log('client_protocol_error', {category, chars});
+  sendClient({jsonrpc:'2.0', id:null, error:{code, message}});
+}
+function validClientMessage(value) {
+  const object = value && typeof value === 'object' && !Array.isArray(value);
+  const hasId = object && Object.hasOwn(value, 'id');
+  const validId = !hasId || value.id === null || typeof value.id === 'string' || (typeof value.id === 'number' && Number.isFinite(value.id));
+  const request = object && typeof value.method === 'string';
+  const response = object && !Object.hasOwn(value, 'method') && hasId && (Object.hasOwn(value, 'result') || Object.hasOwn(value, 'error'));
+  return object && value.jsonrpc === '2.0' && validId && (request || response);
 }
 function active(sessionId) {
   return [...requests.values()].find(r => r.method === 'session/prompt' && r.sessionId === sessionId);
@@ -332,8 +356,16 @@ agentLines.on('line', line => {
 });
 clientLines.on('line', line => {
   if (stopping) return;
-  const m = parse(line, 'ACP client');
-  if (m) try { clientMessage(m); } catch { fail('Failed to forward an ACP client message.'); }
+  const frame = parse(line, 'ACP client');
+  if (!frame) return;
+  for (const m of frame.messages) {
+    if (stopping) break;
+    if (!validClientMessage(m)) {
+      clientProtocolError(-32600, 'Invalid Request: expected a JSON-RPC 2.0 message', 'invalid_message', line.length);
+      continue;
+    }
+    try { clientMessage(m); } catch { fail('Failed to forward an ACP client message.'); }
+  }
 });
 const watchdog = setInterval(() => {
   if (stopping) return;

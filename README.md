@@ -21,6 +21,8 @@ There are limits: the question bridge cannot return multi-select or arbitrary cu
 
 Bridge 2.0 handles output backpressure, drains final replies before exiting, clears abandoned questions, and reports failed connections. Five minutes without ACP activity triggers cancellation, followed by a connection error if Command Code does not stop. Waiting for user input is exempt. The limit is configurable, and tasks are never automatically retried. [Diagnostic notes](./docs/bridge-reliability.md) explain the evidence and testing limits for the reported post-compaction stall.
 
+Bridge 2.0.1 also accepts client JSON-RPC batches and returns protocol errors for malformed client frames without closing the provider. This corrects the fatal client-input handling that caused the subsequent code-1 exit.
+
 ## Why this exists
 
 Command Code's built-in `/context` is a terminal-UI overlay. When Command Code runs behind an ACP client (Zed, T3 Code, …), that overlay is not part of the ACP command surface — a command the ACP layer does not resolve falls through to the model as ordinary prompt text. This mod publishes the same kind of information as plain-text slash commands, and keeps a live status line in the footer for terminal use.

@@ -30,7 +30,7 @@ This uses T3's existing proposed-plan and question support. It does not wire T3'
 
 ## Connection handling
 
-The bridge respects output backpressure and flushes final messages before closing. Child exit, broken pipes, and malformed protocol output fail outstanding requests explicitly. Stop and session teardown clear question mappings; late answers cannot answer a later turn. Ordinary permission requests still pass through.
+The bridge respects output backpressure and flushes final messages before closing. Child exit, broken pipes, and malformed Command Code output fail outstanding requests explicitly. Malformed client input receives a JSON-RPC parse/invalid-request error without terminating the provider. Client batches are expanded into individual frames for Command Code; T3 correlates the individual replies by request ID. Stop and session teardown clear question mappings; late answers cannot answer a later turn. Ordinary permission requests still pass through.
 
 The default silence limit is five minutes without ACP messages for an outstanding request. The bridge first sends cancellation; after five more seconds without completion it fails the connection. Waiting for a user question or native client request is exempt. Thinking and tool updates refresh the limit. Long native computations or tools that emit no activity may need a longer limit. There are no automatic task retries, automatic resumes, or fabricated thinking messages.
 

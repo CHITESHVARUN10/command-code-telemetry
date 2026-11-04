@@ -1,5 +1,11 @@
 # ACP bridge reliability and plan review investigation
 
+## Bridge 2.0.1 follow-up
+
+The 2026-11-04 16:28 IST screenshot was accompanied by a bridge diagnostic at 10:58:00 UTC: `Invalid JSON-RPC from ACP client; the connection was closed instead of dropping a message.` The process had received 226 agent messages, including 61 thinking chunks, and had no outstanding recorded requests when it rejected the frame. Its fatal client-input policy set the bridge exit code to 1 even though the native child subsequently exited with code 0. This identifies the immediate reason for that provider exit, rather than attributing it to a model crash or silence timeout.
+
+Version 2.0's diagnostic did not distinguish failed JSON parsing from rejection of arrays or primitive values. The exact client frame was intentionally not retained, so its shape cannot be reconstructed. Installed T3's Effect JSON-RPC codec supports batch encoding, while the installed Command Code ACP parser rejects batches. Version 2.0.1 expands client batches into individual frames, returns standard parse/invalid-request errors for bad client input without terminating the provider, and records only error category and frame length. Malformed native output remains a transport failure. Tests cover continued thinking after a bad client frame, invalid message shapes, batch order and responses, and fragmented large UTF-8 input. No request was sent to the affected session during this follow-up.
+
 Inspected 2026-11-04 against Command Code 1.88.2 and installed T3 Code Beta 0.1.5. The repository and installed bridge had identical hashes before this change. No prompt, resume, compaction, cancellation, provider change, or other action was sent to the user's affected thread or native session. Local diagnostic files were read only; tests used synthetic children and newly created isolated native sessions.
 
 ## What the evidence establishes

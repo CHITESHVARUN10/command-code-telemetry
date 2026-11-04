@@ -252,6 +252,51 @@ test('child exit and malformed output settle pending prompts as errors', {timeou
   }
 });
 
+test('malformed client JSON reports a protocol error without killing an active prompt', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  f.send(prompt(1,'a','task')); await f.received();
+  f.p.stdin.write('{broken-json\n');
+  const error = await f.next(); assert.equal(error.id, null); assert.equal(error.error.code, -32700);
+  const thought = update('a', {sessionUpdate:'agent_thought_chunk', content:{type:'text', text:'still working'}});
+  f.agent(thought); assert.deepEqual(await f.next(), thought);
+  f.agent(result(1)); assert.deepEqual(await f.next(), result(1));
+  f.send(prompt(2,'a','next task')); assert.deepEqual(await f.received(), prompt(2,'a','next task'));
+  const diagnostics = await readFile(join(f.dir, 'diagnostics.ndjson'), 'utf8');
+  assert.match(diagnostics, /client_protocol_error/); assert.ok(!diagnostics.includes('broken-json'));
+});
+
+test('invalid client message shapes do not close the connection', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  for (const value of [null, 42, 'text', [], {}, {jsonrpc:'2.0', method:3}, {jsonrpc:'2.0', id:{}, method:'test'}]) {
+    f.send(value); assert.equal((await f.next()).error.code, -32600);
+  }
+  f.send(prompt(1,'a','task')); assert.deepEqual(await f.received(), prompt(1,'a','task'));
+});
+
+test('T3 JSON-RPC batches expand in order and recover from invalid members', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  const a = prompt(1,'a','first'), b = prompt(2,'b','second');
+  f.send([a,b]); assert.deepEqual(await f.received(), a); assert.deepEqual(await f.received(), b);
+  f.agent(result(1)); assert.equal((await f.next()).id, 1);
+  f.agent(result(2)); assert.equal((await f.next()).id, 2);
+  const c = prompt(3,'a','third');
+  f.send([null,c]);
+  const messages = [await f.next(), await f.next()];
+  assert.equal(messages.find(m => m.error)?.error.code, -32600);
+  assert.deepEqual(messages.find(m => m.method === 'test/received')?.params, c);
+});
+
+test('large fragmented UTF-8 client input round-trips as a complete prompt', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  const m = prompt(1,'a','🧠\n'.repeat(100_000));
+  const bytes = Buffer.from(JSON.stringify(m) + '\n');
+  for (let offset = 0; offset < bytes.length; offset += 8191) {
+    if (!f.p.stdin.write(bytes.subarray(offset, offset + 8191))) await new Promise(resolve => f.p.stdin.once('drain', resolve));
+  }
+  assert.deepEqual(await f.received(), m);
+  f.agent(result(1)); assert.deepEqual(await f.next(), result(1));
+});
+
 test('large final thinking frame is drained fully even with a slow ACP reader', {timeout:10_000}, async t => {
   const f = await fixture(t);
   const large = update('a', {sessionUpdate:'agent_thought_chunk', content:{type:'text', text:'🧠'.repeat(700_000)}});
