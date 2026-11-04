@@ -20,6 +20,6 @@
     "node": ">=22.6"
   },
   "scripts": {
-    "test": "node --experimental-strip-types session-monitor.test.mjs"
+    "test": "node --experimental-strip-types session-monitor.test.mjs && node --test acp-question-bridge/bridge.test.mjs"
   }
 }

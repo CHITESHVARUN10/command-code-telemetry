@@ -15,9 +15,11 @@ This repository contains two independent components that can be used together:
 - **Session monitor mod** ([session-monitor.ts](./session-monitor.ts)) loads inside Command Code. It provides telemetry, `/tokens`, `/con`, `/com`, and a best-effort plan review guardrail in terminal and ACP sessions.
 - **ACP bridge** ([acp-question-bridge/bridge.mjs](./acp-question-bridge/bridge.mjs)) runs between an ACP client such as T3 Code and Command Code. It starts the real `cmd acp` process and forwards its ACP messages in both directions, with targeted changes described below. It does not replace the Command Code harness or require the session monitor mod.
 
-The bridge forwards ordinary ACP traffic, including normal prompts, tool calls, session messages and permission requests. It translates recognized single-choice questions into ACP forms so a compatible client can show an interactive question; it provides a text `/context` reading from host usage updates; and it translates `/cccompact` into Command Code's native `/compact`. Other ACP clients may render these interactions differently. These are intended pass-through semantics, not a guarantee that every ACP feature or every client combination has been tested.
+The bridge forwards ordinary ACP traffic, including normal prompts, thinking, tool calls, session messages and permission requests. It translates recognized single-choice questions into ACP forms; provides `/context` from host usage updates; translates `/cccompact` into native `/compact`; and adds `/plan <task>` (also `/ccplan`) to enter native plan mode before planning. Plan reviews publish the identified plan as a T3 proposed-plan item and wait for an **Implement this plan** choice. A custom answer on a plan review requests revision, followed by another review; it never approves implementation. Other ACP clients may render these interactions differently. These are intended pass-through semantics, not a guarantee that every ACP feature or every client combination has been tested.
 
 There are limits: the question bridge cannot return multi-select or arbitrary custom text through Command Code's current question transport; cancellation may still lead the model to proceed with an assumption. `/context` uses the last ACP host reading, which can be an estimate and is **not** the terminal's detailed `/context` analysis. T3 currently intercepts `/compact` before the generic ACP provider receives it, so use `/cccompact` in a bridge session. See [bridge documentation](./acp-question-bridge/README.md) and [ACP capability research](./docs/acp-capability-research.md).
+
+Bridge 2.0 handles output backpressure, drains final replies before exiting, clears abandoned questions, and reports failed connections. Five minutes without ACP activity triggers cancellation, followed by a connection error if Command Code does not stop. Waiting for user input is exempt. The limit is configurable, and tasks are never automatically retried. [Diagnostic notes](./docs/bridge-reliability.md) explain the evidence and testing limits for the reported post-compaction stall.
 
 ## Why this exists
 
@@ -188,10 +190,11 @@ Built against the documented [ModApi](https://commandcode.ai/docs/mods) only —
 
 ```sh
 npm test
-node --test acp-question-bridge/bridge.test.mjs
 ```
 
 Runs the real mod factory against a stubbed ModApi: 17 checks covering registration, footer rendering, `/tokens`, `/con`, `/com`, reset, the plan gate, the subagent guard, malformed events, persistence + resume, and catalog scanning. The bundle-hydration check runs when a Command Code install is present and is skipped otherwise.
+
+It also runs the bridge integration suite with isolated child processes: explicit answers, cancellation, native command precedence, plan display/approval/revision, session isolation, silence handling, connection errors, and a large thinking message with a slow reader. Run just that suite with `node --test acp-question-bridge/bridge.test.mjs`.
 
 No npm dependencies. The bridge needs Node.js; Node ≥ 22.6 is required for the TypeScript test via type stripping. CI runs the suite on Node 22 and 24.
 

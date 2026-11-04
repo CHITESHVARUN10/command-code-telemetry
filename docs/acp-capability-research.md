@@ -2,6 +2,8 @@
 
 Inspected locally on 2026-10-31 against installed Command Code 1.88.2 and T3 Code Beta 0.1.5. This list covers gaps identified by this investigation, not every tool or command. Command Code's ACP documentation says the harness keeps its tools and skills; tool execution and rendering a terminal-only UI are different capabilities.
 
+Update 2026-11-04: bridge 2.0 adds native plan-mode commands, reconstructed markdown plan display, explicit approval, and plan-feedback continuation. Full editor parity and exact plan identity across concurrent native planning sessions remain limited by missing native ACP metadata. See [current bridge investigation](./bridge-reliability.md). The table below records the earlier investigation.
+
 | Capability | Current behavior | Possible future work |
 |---|---|---|
 | Terminal `/context` analysis | Terminal runs `analyzeCommandContext` over the active harness messages and collects tool, MCP, skill, agent and memory information. ACP emits a separate `usage_update`; the mod API exposes `getContextUsage`, but not this analysis. The bridge's `/context` cannot claim parity. | Command Code could expose the existing analysis as a structured ACP command or documented mod API and send it to T3. Test identical session state, model settings and before/after compaction, including breakdown. Copying private bundled functions would be version-sensitive and still needs access to the live session state. |
