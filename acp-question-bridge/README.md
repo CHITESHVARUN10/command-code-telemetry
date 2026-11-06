@@ -2,6 +2,8 @@
 
 The bridge runs the real `/usr/local/bin/cmd acp` and forwards normal prompts, thinking, tool calls, permissions, session management, and unknown ACP methods. It converts recognized Command Code questions to ACP elicitation forms so T3 asks the user even with full access. Only submitted answers select options. It is independent of the session monitor mod.
 
+T3's inline charts and interactive HTML use its existing `html_preview` and `html_render` MCP tools. T3 supplies their connection to Command Code through ACP; this bridge already forwards that configuration and the visual tool results. No separate visual server or runtime update is required for direct calls. Native Plan mode hides MCP tools. See [visual-tool investigation, verification limits, and test prompt](../docs/t3-visual-tools.md).
+
 ## Commands
 
 | Command | Behavior |

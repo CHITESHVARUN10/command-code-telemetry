@@ -304,3 +304,50 @@ test('large final thinking frame is drained fully even with a slow ACP reader', 
   await new Promise(resolve => setTimeout(resolve, 150)); f.p.stdout.resume();
   assert.deepEqual(await f.next(), large); assert.equal((await f.exit).code, 0);
 });
+
+test('T3 MCP configuration survives initialize, new, load, resume and fork unchanged', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  const initialize = rpc(1, 'initialize', {protocolVersion:2, clientInfo:{name:'t3-code'}, clientCapabilities:{elicitation:{form:{}}}});
+  f.send(initialize); assert.deepEqual(await f.received(), initialize);
+  const capabilities = result(1, {protocolVersion:2, agentCapabilities:{mcpCapabilities:{http:true, sse:false}}});
+  f.agent(capabilities); assert.deepEqual(await f.next(), capabilities);
+  const servers = [
+    {name:'t3-code', command:'/Applications/T3 Code.app/Contents/MacOS/T3 Code', args:['acp-mcp-bridge'],
+      env:[{name:'T3_ACP_MCP_ENDPOINT', value:'http://127.0.0.1:1234/test'}, {name:'T3_ACP_MCP_AUTHORIZATION', value:'test-private-credential'}]},
+    {name:'other', type:'http', url:'http://127.0.0.1:1235/mcp', headers:[{name:'Authorization', value:'test-private-header'}]}
+  ];
+  for (const [index, method] of ['session/new','session/load','session/resume','session/fork'].entries()) {
+    const m = rpc(index + 2, method, {cwd:'/tmp/example', ...(index ? {sessionId:'a'} : {}), mcpServers:servers});
+    f.send(m); assert.deepEqual(await f.received(), m);
+    f.agent(result(m.id, {sessionId:'a'})); await f.next();
+  }
+  const diagnostics = await readFile(join(f.dir, 'diagnostics.ndjson'), 'utf8');
+  assert.ok(!diagnostics.includes('test-private'));
+  assert.ok(!diagnostics.includes('T3_ACP_MCP_ENDPOINT'));
+});
+
+test('visual MCP calls preserve HTML, preview images, attachment references and failures', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  const html = '<!doctype html><html><body><button onclick="this.textContent=\'Selected π\'">Choose</button><script>const v=[2,5,3]</script></body></html>';
+  for (const sessionId of ['a','b']) {
+    f.send(prompt('prompt-' + sessionId, sessionId, 'Show a chart')); await f.received();
+    for (const tool of ['html_preview','html_render']) {
+      const id = sessionId + '-' + tool;
+      const input = tool === 'html_preview' ? {html, width:728} : {html, height:240, title:'Chart π'};
+      // Command Code sends the qualified MCP name in title, input in rawInput,
+      // and the MCP result as text/image content rather than typed rawOutput.
+      const started = update(sessionId, {sessionUpdate:'tool_call', toolCallId:id, title:'mcp__t3-code__' + tool, kind:'other', status:'pending', rawInput:input});
+      f.agent(started); assert.deepEqual(await f.next(), started);
+      const output = tool === 'html_preview'
+        ? [{type:'content', content:{type:'text', text:'{"contentHeight":240}'}}, {type:'content', content:{type:'image', mimeType:'image/png', data:'test-image-base64'}}]
+        : [{type:'content', content:{type:'text', text:JSON.stringify({htmlRender:{attachmentId:sessionId + '-attachment', title:'Chart π', height:240}, message:'Shown'})}}];
+      const completed = update(sessionId, {sessionUpdate:'tool_call_update', toolCallId:id, status:'completed', content:output});
+      f.agent(completed); assert.deepEqual(await f.next(), completed);
+    }
+  }
+  const failed = update('a', {sessionUpdate:'tool_call_update', toolCallId:'a-html_render', status:'failed', content:[{type:'content', content:{type:'text', text:'Rendering failed'}}]});
+  f.agent(failed); assert.deepEqual(await f.next(), failed);
+  for (const sessionId of ['b','a']) { f.agent(result('prompt-' + sessionId)); assert.equal((await f.next()).id, 'prompt-' + sessionId); }
+  const diagnostics = await readFile(join(f.dir, 'diagnostics.ndjson'), 'utf8');
+  assert.ok(!diagnostics.includes(html)); assert.ok(!diagnostics.includes('attachment'));
+});
