@@ -12,6 +12,8 @@ Live model, context, speed, and cache telemetry for [Command Code](https://comma
 
 This repository contains two independent components that can be used together:
 
+Bridge 2.0.3 adds [failure-only diagnostic reports](./acp-question-bridge/README.md#failure-only-reports-203). See the [research on other Command Code ACP adapters](./docs/acp-alternatives.md) for their failure-handling approaches and compatibility limits.
+
 - **Session monitor mod** ([session-monitor.ts](./session-monitor.ts)) loads inside Command Code. It provides telemetry, `/tokens`, `/con`, `/com`, and a best-effort plan review guardrail in terminal and ACP sessions.
 - **ACP bridge** ([acp-question-bridge/bridge.mjs](./acp-question-bridge/bridge.mjs)) runs between an ACP client such as T3 Code and Command Code. It starts the real `cmd acp` process and forwards its ACP messages in both directions, with targeted changes described below. It does not replace the Command Code harness or require the session monitor mod.
 
@@ -21,7 +23,7 @@ T3's `html_preview` / `html_render` MCP tools provide inline charts and interact
 
 There are limits: the question bridge cannot return multi-select or arbitrary custom text through Command Code's current question transport; cancellation may still lead the model to proceed with an assumption. `/context` uses the last ACP host reading, which can be an estimate and is **not** the terminal's detailed `/context` analysis. T3 currently intercepts `/compact` before the generic ACP provider receives it, so use `/cccompact` in a bridge session. See [bridge documentation](./acp-question-bridge/README.md) and [ACP capability research](./docs/acp-capability-research.md).
 
-Bridge 2.0 handles output backpressure, drains final replies before exiting, clears abandoned questions, and reports failed connections. Five minutes without ACP activity triggers cancellation, followed by a connection error if Command Code does not stop. Waiting for user input is exempt. The limit is configurable, and tasks are never automatically retried. [Diagnostic notes](./docs/bridge-reliability.md) explain the evidence and testing limits for the reported post-compaction stall.
+Bridge 2.0 handles output backpressure, drains final replies before exiting, clears abandoned questions, and reports failed connections. Since 2.0.2, silence alone does not cancel work by default: long tools and model requests can be quiet. Automatic silence cancellation requires an explicit positive `COMMAND_CODE_BRIDGE_IDLE_MS` setting. Manual Stop still works, and tasks are never automatically retried. [Diagnostic notes](./docs/bridge-reliability.md) explain the evidence and testing limits for the reported stalls.
 
 Bridge 2.0.1 also accepts client JSON-RPC batches and returns protocol errors for malformed client frames without closing the provider. This corrects the fatal client-input handling that caused the subsequent code-1 exit.
 

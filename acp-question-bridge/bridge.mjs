@@ -3,17 +3,20 @@
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {randomUUID, createHash} from 'node:crypto';
-import {appendFileSync, mkdirSync, statSync, renameSync, realpathSync, openSync, readFileSync, closeSync, fstatSync} from 'node:fs';
+import {appendFileSync, mkdirSync, statSync, renameSync, realpathSync, openSync, readFileSync, closeSync, fstatSync, writeFileSync, readdirSync, unlinkSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join, dirname, resolve, relative, isAbsolute} from 'node:path';
 
 const executable = process.env.COMMAND_CODE_BINARY || '/usr/local/bin/cmd';
-const VERSION = '2.0.1';
+const VERSION = '2.0.3';
 const numberOption = (key, fallback) => {
   const value = Number(process.env[key]);
   return Number.isFinite(value) && value >= 0 && process.env[key] !== '' ? value : fallback;
 };
-const idleMs = numberOption('COMMAND_CODE_BRIDGE_IDLE_MS', 300_000);
+// ACP has no mandatory heartbeat. Silence alone cannot establish a dead turn:
+// tools, model requests, and a sleeping host can all produce long quiet periods.
+// Keep cancellation opt-in; transport failures and explicit Stop still work.
+const idleMs = numberOption('COMMAND_CODE_BRIDGE_IDLE_MS', 0);
 const cancelMs = numberOption('COMMAND_CODE_BRIDGE_CANCEL_MS', 5_000);
 const logPath = process.env.COMMAND_CODE_BRIDGE_LOG ?? join(homedir(), '.commandcode/acp-question-bridge/diagnostics.ndjson');
 function log(event, fields = {}) {
@@ -37,6 +40,56 @@ let seq = 0, stopping = false, clientEnded = false, finishTimer, lastProgress = 
 let formSupport = true, planSupport = false;
 const counters = {fromAgent:0, fromClient:0, thoughts:0, backpressure:0};
 const blocked = new WeakSet();
+const crashDir = process.env.COMMAND_CODE_BRIDGE_CRASH_DIR ?? join(homedir(), '.commandcode/acp-question-bridge/crashes');
+const startedAt = Date.now(), flight = [];
+let fatalReport, childExit = null, lastTick = Date.now(), maxTickGapMs = 0, nativeVersion = null;
+const methods = new Set(['initialize','authenticate','session/new','session/load','session/resume','session/list','session/fork','session/close','session/prompt','session/cancel','session/set_mode','session/set_model','session/set_config_option','session/update','session/request_permission','elicitation/create']);
+const updates = new Set(['agent_message_chunk','agent_thought_chunk','user_message_chunk','tool_call','tool_call_update','usage_update','available_commands_update','plan','plan_update','current_mode_update','config_option_update','session_info_update']);
+const safeMethod = value => methods.has(value) ? value : 'extension';
+const alias = value => value === undefined ? null : createHash('sha256').update(prefix + JSON.stringify(value)).digest('hex').slice(0, 16);
+function trace(direction, value, chars) {
+  // A bounded in-memory flight recorder. Never retain wire payloads or titles.
+  const u = value?.params?.update;
+  const event = {at:new Date().toISOString(), direction, method:value?.method ? safeMethod(value.method) : 'response',
+    request:alias(value?.id), session:alias(value?.params?.sessionId), chars,
+    ...(u ? {update:updates.has(u.sessionUpdate) ? u.sessionUpdate : 'extension', tool:alias(u.toolCallId),
+      status:['pending','in_progress','completed','failed'].includes(u.status) ? u.status : undefined} : {}),
+    ...(Number.isFinite(value?.error?.code) ? {errorCode:value.error.code} : {})};
+  flight.push(event); if (flight.length > 96) flight.shift();
+}
+function failureReport(reason, error, fatal = false) {
+  if (!crashDir || fatal && fatalReport) return;
+  try {
+    const now = Date.now();
+    const report = {schemaVersion:1, at:new Date(now).toISOString(), reason, bridgeVersion:VERSION, nativeVersion,
+      pid:process.pid, childPid:child.pid ?? null, childExit, runtime:{node:process.version, platform:process.platform, arch:process.arch,
+        uptimeMs:now - startedAt, memory:process.memoryUsage()},
+      policy:{idleMs, cancelMs}, state:{stopping, clientEnded, pendingQuestions:pending.size, nativeRequests:agentRequests.size,
+        modeChanges:controls.size, maxTickGapMs, stdoutBufferedBytes:process.stdout.writableLength, childInputBufferedBytes:child.stdin.writableLength,
+        clientOutputNeedsDrain:process.stdout.writableNeedDrain, nativeInputNeedsDrain:child.stdin.writableNeedDrain},
+      systemErrorCode:['ENOENT','EACCES','EPIPE','ECONNRESET','ENOSPC','EMFILE'].includes(error?.code) ? error.code : null,
+      counters:{...counters}, requests:[...requests.entries()].slice(0,32).map(([id,r]) => ({request:alias(id), session:alias(r.sessionId),
+        method:safeMethod(r.method), silentMs:now-r.lastActivity, cancelling:Boolean(r.cancelAt), hasRevisionFeedback:Boolean(r.feedback)})),
+      requestCount:requests.size, activeTools:[...sessions.entries()].flatMap(([session,s])=>[...s.tools.entries()].slice(0,32).map(([id,t])=>({session:alias(session), tool:alias(id),
+        kind:['read','edit','delete','move','search','execute','think','fetch','other'].includes(t.kind) ? t.kind : 'other',
+        status:['pending','in_progress','completed','failed'].includes(t.status) ? t.status : 'unknown'}))).slice(0,32), recentEvents:[...flight],
+      // Own call-site frames locate bridge bugs without copying error messages,
+      // native stderr, file paths supplied by users, or potentially secret text.
+      bridgeFrames:[...String((error instanceof Error ? error : new Error()).stack ?? '').matchAll(/bridge\.mjs:\d+:\d+/g)].map(m=>m[0]).slice(0,12)};
+    mkdirSync(crashDir, {recursive:true, mode:0o700});
+    const path = join(crashDir, `crash-${now}-${process.pid}-${randomUUID()}.json`);
+    writeFileSync(path, JSON.stringify(report,null,2)+'\n', {mode:0o600, flag:'wx'});
+    if (fatal) fatalReport = {path, report};
+    // Retain ten reports; prune only this recorder's names, never other files.
+    const files = readdirSync(crashDir).filter(n=>/^crash-\d+-\d+-[a-f0-9-]+\.json$/.test(n)).sort((a,b)=>Number(b.split('-')[1])-Number(a.split('-')[1]));
+    for (const name of files.slice(10)) try { unlinkSync(join(crashDir,name)); } catch {}
+    try { process.stderr.write(`Command Code bridge failure report: ${path}\n`); } catch {}
+  } catch { /* An unavailable report directory must not alter ACP behavior. */ }
+}
+function finishFailureReport() {
+  if (!fatalReport) return;
+  try { writeFileSync(fatalReport.path, JSON.stringify({...fatalReport.report, childExit},null,2)+'\n', {mode:0o600}); } catch {}
+}
 const clientLines = createInterface({input:process.stdin, crlfDelay:Infinity});
 const agentLines = createInterface({input:child.stdout, crlfDelay:Infinity});
 const state = id => {
@@ -49,7 +102,9 @@ const errorResult = (id, text) => ({jsonrpc:'2.0', id, error:{code:-32603, messa
 
 function write(stream, value, source) {
   if (stream.destroyed || stream.writableEnded) throw new Error('ACP output is closed');
-  if (!stream.write(JSON.stringify(value) + '\n')) {
+  const line = JSON.stringify(value) + '\n';
+  trace(stream === process.stdout ? 'to_client' : 'to_native', value, line.length);
+  if (!stream.write(line)) {
     counters.backpressure++;
     source.pause();
     if (!blocked.has(stream)) {
@@ -65,8 +120,9 @@ function armTermination() {
   finishTimer = setTimeout(() => child.kill('SIGKILL'), cancelMs || 5_000);
   finishTimer.unref();
 }
-function fail(reason) {
+function fail(reason, error) {
   if (stopping) return;
+  failureReport(reason, error, true);
   stopping = true;
   log('transport_failure', {reason, ...counters, outstanding:requests.size, questions:pending.size});
   process.stderr.write(`Command Code bridge: ${reason}\n`);
@@ -88,7 +144,7 @@ function parse(line, direction) {
     value = JSON.parse(line);
   } catch {
     if (fromClient) clientProtocolError(-32700, 'Parse error: invalid JSON', 'invalid_json', line.length);
-    else fail('Invalid JSON-RPC from Command Code; the connection was closed instead of dropping a message.');
+    else { trace('invalid_native_frame', {}, line.length); fail('Invalid JSON-RPC from Command Code; the connection was closed instead of dropping a message.'); }
     return null;
   }
   if (!fromClient && (!value || typeof value !== 'object' || Array.isArray(value))) {
@@ -275,6 +331,8 @@ function agentMessage(m) {
       return;
     }
     const request = requests.get(m.id);
+    if (request?.method === 'initialize' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(m.result?.agentInfo?.version ?? '')) nativeVersion = m.result.agentInfo.version;
+    if (request && m.error) failureReport('native_request_error');
     if (request?.method === 'session/prompt') {
       clearQuestions(request.sessionId);
       state(request.sessionId).tools.clear();
@@ -325,7 +383,7 @@ function clientMessage(m) {
       sendClient({jsonrpc:'2.0', id:m.id, result:{stopReason:'end_turn'}}); return;
     }
     if (text === '/bridge-status' && !s.native.has('bridge-status')) {
-      message(sessionId, `Command Code bridge ${VERSION}\nAgent messages: ${counters.fromAgent}\nThinking chunks forwarded: ${counters.thoughts}\nPending questions: ${pending.size}\nSilence limit: ${idleMs ? `${idleMs / 1000}s` : 'disabled'}\nNo tasks are automatically retried.`);
+      message(sessionId, `Command Code bridge ${VERSION}\nAgent messages: ${counters.fromAgent}\nThinking chunks forwarded: ${counters.thoughts}\nPending questions: ${pending.size}\nSilence limit: ${idleMs ? `${idleMs / 1000}s` : 'disabled'}\nFailure reports: ${crashDir || 'disabled'}\nNo tasks are automatically retried.`);
       sendClient({jsonrpc:'2.0', id:m.id, result:{stopReason:'end_turn'}}); return;
     }
     if (text === '/cccompact' && !s.native.has('cccompact')) m = {...m, params:{...m.params, prompt:[{...prompt[0], text:'/compact'}]}};
@@ -352,7 +410,7 @@ function clientMessage(m) {
 agentLines.on('line', line => {
   if (stopping) return;
   const m = parse(line, 'Command Code');
-  if (m) try { agentMessage(m); } catch { fail('Failed to forward a Command Code message.'); }
+  if (m) try { trace('from_native', m, line.length); agentMessage(m); } catch (error) { fail('Failed to forward a Command Code message.', error); }
 });
 clientLines.on('line', line => {
   if (stopping) return;
@@ -364,12 +422,13 @@ clientLines.on('line', line => {
       clientProtocolError(-32600, 'Invalid Request: expected a JSON-RPC 2.0 message', 'invalid_message', line.length);
       continue;
     }
-    try { clientMessage(m); } catch { fail('Failed to forward an ACP client message.'); }
+    try { trace('from_client', m, line.length); clientMessage(m); } catch (error) { fail('Failed to forward an ACP client message.', error); }
   }
 });
 const watchdog = setInterval(() => {
   if (stopping) return;
   const now = Date.now();
+  maxTickGapMs = Math.max(maxTickGapMs, now-lastTick); lastTick = now;
   if (requests.size && now - lastProgress >= 60_000) {
     log('progress', {...counters, requests:requests.size, questions:pending.size,
       silentMs:Math.max(...[...requests.values()].map(r => now - r.lastActivity))});
@@ -379,6 +438,7 @@ const watchdog = setInterval(() => {
     if (r.cancelAt && now - r.cancelAt >= cancelMs) { fail('Command Code did not finish after cancellation.'); return; }
     const waiting = [...pending.values(), ...agentRequests.values()].some(q => q.sessionId === r.sessionId);
     if (idleMs && !r.cancelAt && !waiting && now - r.lastActivity >= idleMs) {
+      failureReport('opt_in_silence_timeout');
       log('silence_timeout', {method:r.method, ...counters});
       if (r.method === 'session/prompt' && ![...controls.values()].some(control => requests.get(control.clientId) === r)) {
         message(r.sessionId, 'Command Code has not sent ACP activity within the configured silence limit. Cancelling this turn; no task will be retried automatically.');
@@ -394,16 +454,19 @@ process.stdin.on('end', () => {
   for (const r of requests.values()) if (r.method === 'session/prompt') cancel(r.sessionId);
   child.stdin.end(); armTermination();
 });
-process.stdin.on('error', () => fail('ACP client input disconnected.'));
-process.stdout.on('error', () => fail('ACP client output disconnected.'));
-child.stdin.on('error', () => fail('Command Code input pipe closed.'));
-child.stdout.on('error', () => fail('Command Code output pipe closed.'));
-child.on('error', () => fail('Could not start the configured Command Code executable.'));
+process.stdin.on('error', error => fail('ACP client input disconnected.', error));
+process.stdout.on('error', error => fail('ACP client output disconnected.', error));
+child.stdin.on('error', error => fail('Command Code input pipe closed.', error));
+child.stdout.on('error', error => fail('Command Code output pipe closed.', error));
+child.on('error', error => fail('Could not start the configured Command Code executable.', error));
 child.on('close', (code, signal) => {
+  childExit = {code, signal};
   // `exit` is too early: stdout can still contain the final reply. Never process.exit
   // before Node has drained our own stdout, especially after a large replay.
   clearTimeout(finishTimer); clearInterval(watchdog);
-  if (!stopping && requests.size) fail('Command Code closed before replying to outstanding ACP requests.');
+  if (!stopping && !clientEnded && requests.size) fail('Command Code closed before replying to outstanding ACP requests.');
+  if (!stopping && !clientEnded && (code !== 0 || signal)) failureReport('unexpected_native_exit', undefined, true);
+  finishFailureReport();
   clearTimeout(finishTimer);
   stopping = true;
   clientLines.close(); agentLines.close(); process.stdin.destroy();
@@ -411,6 +474,8 @@ child.on('close', (code, signal) => {
   process.exitCode = process.exitCode || code || (signal ? 1 : 0);
   process.stdout.end();
 });
+process.on('uncaughtException', error => fail('Uncaught bridge exception.', error));
+process.on('unhandledRejection', error => fail('Unhandled bridge rejection.', error));
 for (const signal of ['SIGTERM','SIGINT','SIGHUP']) process.on(signal, () => {
   if (stopping) return;
   stopping = true; child.kill(signal); armTermination();

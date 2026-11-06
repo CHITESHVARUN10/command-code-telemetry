@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {mkdtemp, writeFile, chmod, rm, mkdir, readFile, symlink} from 'node:fs/promises';
+import {mkdtemp, writeFile, chmod, rm, mkdir, readFile, symlink, readdir, stat} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createInterface} from 'node:readline';
@@ -18,7 +18,7 @@ const q = (id, sessionId = 'a', plan = false) => {
     options:labels.map((name, i) => ({optionId:`option_${i}`, kind:'allow_once', name}))});
 };
 
-async function fixture(t, options = {}) {
+async function fixture(t, options = {}, expectReady = true) {
   const dir = await mkdtemp(join(tmpdir(), 'cc-bridge-'));
   const fake = join(dir, 'fake');
   await writeFile(fake, `#!/usr/bin/env node
@@ -30,6 +30,7 @@ createInterface({input:process.stdin}).on('line', line => {
  if (m.method === 'test/emit') send(m.params);
  else if (m.method === 'test/invalid') process.stdout.write('not-json\\n');
  else if (m.method === 'test/exit') process.exit(7);
+ else if (m.method === 'test/crash') {process.stderr.write('private-native-stderr'); process.exit(7);}
  else if (m.method === 'test/flood') {
   const data = JSON.stringify(m.params) + '\\n';
   process.stdout.end(data, () => process.exit(0));
@@ -41,6 +42,7 @@ createInterface({input:process.stdin}).on('line', line => {
   await writeFile(esmFake, await readFile(fake)); await chmod(esmFake, 0o755);
   const p = spawn(process.execPath, ['acp-question-bridge/bridge.mjs'], {
     env:{...process.env, HOME:dir, COMMAND_CODE_BINARY:esmFake, COMMAND_CODE_BRIDGE_LOG:join(dir, 'diagnostics.ndjson'),
+      COMMAND_CODE_BRIDGE_CRASH_DIR:join(dir,'.commandcode/acp-question-bridge/crashes'),
       COMMAND_CODE_BRIDGE_IDLE_MS:'0', ...options}, stdio:['pipe','pipe','pipe']});
   let stderr = '', wake, closed = false;
   const queue = [];
@@ -65,9 +67,92 @@ createInterface({input:process.stdin}).on('line', line => {
     if (!closed) {p.stdin.end(); const timer = setTimeout(() => p.kill('SIGKILL'), 500); await exit; clearTimeout(timer);}
     await rm(dir, {recursive:true, force:true});
   });
-  assert.equal((await next()).method, 'test/ready');
+  if (expectReady) assert.equal((await next()).method, 'test/ready');
   return {dir, p, send, agent, next, received, exit, stderr:() => stderr};
 }
+
+async function crashReports(f) {
+  const dir = join(f.dir, '.commandcode/acp-question-bridge/crashes');
+  const names = await readdir(dir).catch(error => {if (error.code === 'ENOENT') return []; throw error;});
+  return Promise.all(names.filter(n=>n.endsWith('.json')).map(async name=>({path:join(dir,name), report:JSON.parse(await readFile(join(dir,name),'utf8'))})));
+}
+
+test('failure recorder stays memory-only during normal work and client teardown', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  f.send(prompt(1,'a','private prompt')); await f.received();
+  f.agent(result(1)); await f.next();
+  f.send(prompt(2,'a','unfinished work')); await f.received();
+  f.p.stdin.end(); await f.exit;
+  assert.deepEqual(await crashReports(f), []);
+});
+
+test('native crash records bounded metadata, pending tools, exit status and code locations without payloads', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  f.send(prompt('private-request-id','private-session-id','private-prompt-and-token')); await f.received();
+  f.agent(update('private-session-id', {sessionUpdate:'tool_call', toolCallId:'private-tool-id', kind:'execute', title:'private-command', status:'in_progress', rawInput:{command:'private-command', token:'private-secret'}})); await f.next();
+  for (let i=0; i<110; i++) {
+    f.agent(update('private-session-id', {sessionUpdate:'agent_thought_chunk', content:{type:'text',text:'private-thought'}})); await f.next();
+  }
+  f.send(rpc(undefined,'test/crash',{}));
+  assert.ok((await f.next()).error); assert.notEqual((await f.exit).code,0);
+  const reports = await crashReports(f); assert.equal(reports.length,1);
+  const {path,report} = reports[0];
+  assert.equal(report.childExit.code,7); assert.equal(report.bridgeVersion,'2.0.3');
+  assert.equal(report.requests[0].method,'session/prompt'); assert.equal(report.activeTools[0].kind,'execute');
+  assert.equal(report.recentEvents.length,96); assert.ok(report.bridgeFrames.length);
+  assert.equal(report.requests[0].session, report.activeTools[0].session);
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  assert.ok(!JSON.stringify(report).includes('private-'));
+  assert.match(f.stderr(),/failure report:/);
+});
+
+test('malformed native output records a failure but never saves the malformed content', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  f.send(prompt(1,'a','private text')); await f.received(); f.send(rpc(undefined,'test/invalid',{}));
+  await f.next(); await f.exit;
+  const reports = await crashReports(f); assert.equal(reports.length,1);
+  assert.match(reports[0].report.reason,/Invalid JSON-RPC/);
+  assert.ok(!JSON.stringify(reports).includes('not-json'));
+});
+
+test('startup failure records its system error code even before any client request', {timeout:10_000}, async t => {
+  const f = await fixture(t, {COMMAND_CODE_BINARY:'/nonexistent-cc-bridge-test-binary'}, false);
+  assert.notEqual((await f.exit).code,0);
+  const reports = await crashReports(f); assert.equal(reports.length,1);
+  assert.equal(reports[0].report.systemErrorCode,'ENOENT');
+  assert.match(reports[0].report.reason,/Could not start/);
+});
+
+test('bridge handler exception captures bridge frames without the offending payload', {timeout:10_000}, async t => {
+  const f = await fixture(t); f.send(prompt(1,'a','private text')); await f.received();
+  f.agent(update('a', {sessionUpdate:'available_commands_update', availableCommands:[null], private:'private-secret'}));
+  assert.ok((await f.next()).error); await f.exit;
+  const reports = await crashReports(f); assert.equal(reports.length,1);
+  assert.match(reports[0].report.reason,/Failed to forward/);
+  assert.ok(reports[0].report.bridgeFrames.length >= 2);
+  assert.ok(!JSON.stringify(reports).includes('private-'));
+});
+
+test('nonfatal native errors produce bounded reports without terminating later turns', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  for (let i=0;i<12;i++) {
+    f.send(prompt(i,'a','private text')); await f.received();
+    f.agent({jsonrpc:'2.0',id:i,error:{code:-32603,message:'private-native-error'}}); await f.next();
+  }
+  const reports = await crashReports(f); assert.equal(reports.length,10);
+  assert.ok(reports.every(({report})=>report.reason==='native_request_error'));
+  assert.ok(!JSON.stringify(reports).includes('private-'));
+  f.send(prompt(99,'a','next')); await f.received(); f.agent(result(99)); assert.equal((await f.next()).id,99);
+});
+
+test('disabled or unwritable crash recording does not interfere with failure handling', {timeout:10_000}, async t => {
+  for (const path of ['', '/dev/null/bridge-crashes']) {
+    const f = await fixture(t, {COMMAND_CODE_BRIDGE_CRASH_DIR:path});
+    f.send(prompt(1,'a','task')); await f.received(); f.send(rpc(undefined,'test/exit',{}));
+    assert.ok((await f.next()).error); assert.notEqual((await f.exit).code,0);
+    assert.deepEqual(await crashReports(f), []);
+  }
+});
 
 test('explicit non-recommended selection, custom/cancel, and normal permissions', {timeout:10_000}, async t => {
   const f = await fixture(t);
@@ -220,7 +305,23 @@ test('unsupported forms cancel the question instead of choosing a default', {tim
   assert.match(responses.find(m => m.method === 'session/update').params.update.content.text, /does not advertise question forms/);
 });
 
-test('silent post-compaction turn is cancelled and an unresponsive child fails visibly', {timeout:10_000}, async t => {
+test('default policy preserves silent work, accepts late output, and still forwards Stop', {timeout:10_000}, async t => {
+  const f = await fixture(t, {COMMAND_CODE_BRIDGE_IDLE_MS:undefined});
+  const started = JSON.parse((await readFile(join(f.dir, 'diagnostics.ndjson'), 'utf8')).trim().split('\n')[0]);
+  assert.equal(started.idleMs, 0, 'Silence cancellation must require an explicit setting');
+  f.send(prompt(1,'a','quiet tool')); await f.received();
+  await new Promise(resolve => setTimeout(resolve, 220));
+  const output = update('a', {sessionUpdate:'agent_message_chunk', content:{type:'text', text:'Tool finished'}});
+  f.agent(output); assert.deepEqual(await f.next(), output);
+  f.agent(result(1)); assert.deepEqual(await f.next(), result(1));
+  f.send(prompt(2,'a','another task')); await f.received();
+  const stop = rpc(undefined, 'session/cancel', {sessionId:'a'});
+  f.send(stop); assert.deepEqual(await f.received(), stop);
+  f.agent(result(2, {stopReason:'cancelled'})); assert.deepEqual(await f.next(), result(2, {stopReason:'cancelled'}));
+  assert.ok(!(await readFile(join(f.dir, 'diagnostics.ndjson'), 'utf8')).includes('silence_timeout'));
+});
+
+test('opt-in silence timeout cancels post-compaction work and fails an unresponsive child visibly', {timeout:10_000}, async t => {
   const f = await fixture(t, {COMMAND_CODE_BRIDGE_IDLE_MS:'100', COMMAND_CODE_BRIDGE_CANCEL_MS:'100'});
   f.send(prompt(1,'a','/cccompact')); await f.received(); f.agent(result(1)); await f.next();
   f.send(prompt(2,'a','continue')); await f.received();

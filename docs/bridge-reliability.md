@@ -1,5 +1,23 @@
 # ACP bridge reliability and plan review investigation
 
+## Bridge 2.0.3: failure-only flight recorder
+
+The last 96 metadata-only transport events stay in memory during normal work. Detected startup, protocol/pipe, unexpected native-exit and bridge-handler failures flush a bounded snapshot to the local `crashes` directory; structured native request errors and opt-in silence timeouts also produce labeled failure reports without being misclassified as process crashes. Fatal reports are updated with the eventual native close status. Ordinary client teardown no longer enters the unexpected-exit failure path just because a prompt was pending when the client disconnected.
+
+Reports contain sanitized bridge call-site frames, runtime/version/process data, pending request ages, active tool kinds/statuses, per-process hashed correlation identifiers, buffered-output state and observed timer gaps. No raw payloads, native stderr, credentials, prompts, commands or answers are retained. Report-write failures are contained. Owner-only files retain the ten newest reports. See [configuration and limits](../acp-question-bridge/README.md#failure-only-reports-203) and [other ACP adapter research](./acp-alternatives.md).
+
+Additional subprocess tests cover no report on normal teardown, crash state/exit status, metadata bounds and privacy, startup ENOENT, bridge exception call sites, native request errors without terminating later turns, retention, and disabled/unwritable report storage. The unchanged monitor remains independent.
+
+## Bridge 2.0.2: silence is not proof of failure
+
+The November 6 screenshot's cancellation is confirmed by bridge diagnostics at 11:59:27.516 UTC. Bridge 2.0.1 had received 3,793 native messages, including 3,165 thinking chunks, before triggering `silence_timeout`. Command Code returned `stopReason: cancelled` 15 milliseconds later. The bridge initiated this cancellation; no native crash was recorded at that point.
+
+The last recorded inactivity was 944,912 ms (about 15 minutes 45 seconds), despite a configured 300,000 ms timeout. There was also a long gap between progress records. This establishes delayed timer observation, but cannot distinguish host sleep, process suspension, event-loop delay, or the underlying cause of missing native output. The diagnostic does not retain tool input/output, so it cannot identify which command or request was waiting. No prompt, resume, cancellation, or other action was sent to the affected session for this investigation.
+
+The default automatic cancellation introduced in 2.0 was too aggressive: ACP does not require periodic heartbeats. In 2.0.2, `COMMAND_CODE_BRIDGE_IDLE_MS` defaults to `0` (disabled). A positive explicit value retains the previous cancellation behavior. Progress diagnostics, manual Stop, cancellation grace handling, and actual transport failure detection remain. This prevents the bridge's default policy from cancelling legitimate silent work; it does not fix or automatically diagnose a stalled model/tool. A connected but genuinely stuck provider can wait until manually stopped. Existing processes retain their original policy until reconnected.
+
+Regression coverage checks the unset default, delayed output after silence, a subsequent turn, manual Stop, and opt-in automatic cancellation against an unresponsive child. Native smoke checks use fresh disposable sessions only.
+
 ## Bridge 2.0.1 follow-up
 
 The 2026-11-04 16:28 IST screenshot was accompanied by a bridge diagnostic at 10:58:00 UTC: `Invalid JSON-RPC from ACP client; the connection was closed instead of dropping a message.` The process had received 226 agent messages, including 61 thinking chunks, and had no outstanding recorded requests when it rejected the frame. Its fatal client-input policy set the bridge exit code to 1 even though the native child subsequently exited with code 0. This identifies the immediate reason for that provider exit, rather than attributing it to a model crash or silence timeout.
@@ -20,7 +38,7 @@ The old bridge did have concrete reliability gaps:
 - It retained translated questions after cancellation and did not bind their lifecycle to the originating session/turn.
 - It had no activity diagnostics or silence/cancellation deadline. A connected child that stopped producing output could leave the client waiting indefinitely.
 
-These are fixed without changing the installed Command Code bundle or T3 application. They are failure modes covered by regression tests, not a claim that the historical stall has been conclusively reproduced or that all provider stalls can be prevented. Silence cancellation is a recovery mechanism and can interrupt legitimate work that produces no ACP activity for the configured interval.
+These were addressed without changing the installed Command Code bundle or T3 application. They are failure modes covered by regression tests, not a claim that the historical stall has been conclusively reproduced or that all provider stalls can be prevented. Since 2.0.2, silence cancellation is an opt-in recovery mechanism because it can interrupt legitimate work that produces no ACP activity for the configured interval.
 
 A controlled comparison reproduced truncation: with a slow client, the previous committed bridge returned 131,072 bytes of a 2,800,164-byte final thinking frame, leaving invalid JSON while reporting exit code 0. The updated bridge returned all 2,800,164 bytes as a complete JSON frame. This demonstrates the transport bug independently of the affected session.
 

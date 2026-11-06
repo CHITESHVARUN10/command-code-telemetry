@@ -34,16 +34,27 @@ This uses T3's existing proposed-plan and question support. It does not wire T3'
 
 The bridge respects output backpressure and flushes final messages before closing. Child exit, broken pipes, and malformed Command Code output fail outstanding requests explicitly. Malformed client input receives a JSON-RPC parse/invalid-request error without terminating the provider. Client batches are expanded into individual frames for Command Code; T3 correlates the individual replies by request ID. Stop and session teardown clear question mappings; late answers cannot answer a later turn. Ordinary permission requests still pass through.
 
-The default silence limit is five minutes without ACP messages for an outstanding request. The bridge first sends cancellation; after five more seconds without completion it fails the connection. Waiting for a user question or native client request is exempt. Thinking and tool updates refresh the limit. Long native computations or tools that emit no activity may need a longer limit. There are no automatic task retries, automatic resumes, or fabricated thinking messages.
+Since bridge 2.0.2, silence cancellation is **disabled by default**. ACP does not guarantee heartbeats: a tool, model request, or suspended host can be quiet without proving failure. Diagnostics still record inactivity; manual Stop and actual transport failures still work. A genuinely stalled but connected provider can therefore remain waiting until you stop it.
+
+To opt into automatic cancellation, set `COMMAND_CODE_BRIDGE_IDLE_MS` to a positive duration. At that limit the bridge sends cancellation; after `COMMAND_CODE_BRIDGE_CANCEL_MS` without completion it fails the connection. Waiting for a user question or native client request is exempt. Thinking and tool updates refresh the limit. This policy can interrupt legitimate silent work. There are no automatic task retries, automatic resumes, or fabricated thinking messages.
 
 Diagnostics rotate at approximately 1 MiB, keeping the current file and one backup. They contain counts and lifecycle events, not prompts, answers, plans, credentials, or captured child stderr. Command Code's own stderr is still forwarded to the client as before.
+
+### Failure-only reports (2.0.3)
+
+The bridge keeps the last 96 message summaries in memory and writes a separate JSON report **only on a detected failure**: startup/pipe/protocol failure, unexpected native exit, bridge exception, a native JSON-RPC request error, or an explicitly enabled silence timeout. Request errors and timeouts are labeled as such; they are not necessarily process crashes. Normal completion, normal client teardown, and ordinary Stop do not create reports.
+
+Reports live in `~/.commandcode/acp-question-bridge/crashes/`, retain the ten newest files, and use owner-only file permissions. They include version/runtime information, native exit code/signal when available, message counts and sizes, pending request ages, tool kinds/statuses, output backpressure, observed timer gaps, and bridge source line numbers. Request/session/tool identifiers are hashed with a per-process salt. Prompts, answers, HTML, commands, tool titles, environment values, raw error messages, and native stderr are excluded. The existing lifecycle diagnostic is separate; set `COMMAND_CODE_BRIDGE_LOG` to an empty string if you want only failure reports on disk.
+
+The report path is printed to stderr on failure and the directory appears in `/bridge-status`. Share the latest JSON report for diagnosis. Reports locate the bridge boundary that failed, not the internal source line of a native tool/model service. A silent live hang alone does not trigger a report with the default policy. SIGKILL, power loss, and failures before JavaScript loads cannot reliably produce an in-process report. Recording errors never deliberately terminate the bridge.
 
 | Environment variable | Default |
 | --- | --- |
 | `COMMAND_CODE_BINARY` | `/usr/local/bin/cmd` |
-| `COMMAND_CODE_BRIDGE_IDLE_MS` | `300000`; `0` disables silence cancellation |
+| `COMMAND_CODE_BRIDGE_IDLE_MS` | `0` (disabled); positive milliseconds opt into silence cancellation |
 | `COMMAND_CODE_BRIDGE_CANCEL_MS` | `5000` |
 | `COMMAND_CODE_BRIDGE_LOG` | `~/.commandcode/acp-question-bridge/diagnostics.ndjson`; empty disables logging |
+| `COMMAND_CODE_BRIDGE_CRASH_DIR` | `~/.commandcode/acp-question-bridge/crashes/`; empty disables failure reports |
 
 Configure these on the local ACP provider's process environment. New provider processes load new bridge code; replacing the file does not update or interrupt an existing process.
 
