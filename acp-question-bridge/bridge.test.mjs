@@ -5,6 +5,7 @@ import {mkdtemp, writeFile, chmod, rm, mkdir, readFile, symlink, readdir, stat} 
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createInterface} from 'node:readline';
+import t3Guidance, {T3_GUIDANCE} from './t3-guidance.mjs';
 
 const rpc = (id, method, params) => ({jsonrpc:'2.0', ...(id === undefined ? {} : {id}), method, params});
 const result = (id, value = {stopReason:'end_turn'}) => ({jsonrpc:'2.0', id, result:value});
@@ -24,7 +25,7 @@ async function fixture(t, options = {}, expectReady = true) {
   await writeFile(fake, `#!/usr/bin/env node
 import {createInterface} from 'node:readline';
 const send = x => process.stdout.write(JSON.stringify(x) + '\\n');
-send({jsonrpc:'2.0', method:'test/ready'});
+send({jsonrpc:'2.0', method:'test/ready', params:{args:process.argv.slice(2)}});
 createInterface({input:process.stdin}).on('line', line => {
  const m = JSON.parse(line);
  if (m.method === 'test/emit') send(m.params);
@@ -43,7 +44,7 @@ createInterface({input:process.stdin}).on('line', line => {
   const p = spawn(process.execPath, ['acp-question-bridge/bridge.mjs'], {
     env:{...process.env, HOME:dir, COMMAND_CODE_BINARY:esmFake, COMMAND_CODE_BRIDGE_LOG:join(dir, 'diagnostics.ndjson'),
       COMMAND_CODE_BRIDGE_CRASH_DIR:join(dir,'.commandcode/acp-question-bridge/crashes'),
-      COMMAND_CODE_BRIDGE_IDLE_MS:'0', ...options}, stdio:['pipe','pipe','pipe']});
+      COMMAND_CODE_BRIDGE_IDLE_MS:'0', COMMAND_CODE_BRIDGE_T3_GUIDANCE:'1', ...options}, stdio:['pipe','pipe','pipe']});
   let stderr = '', wake, closed = false;
   const queue = [];
   p.stderr.on('data', d => {stderr += d});
@@ -67,9 +68,43 @@ createInterface({input:process.stdin}).on('line', line => {
     if (!closed) {p.stdin.end(); const timer = setTimeout(() => p.kill('SIGKILL'), 500); await exit; clearTimeout(timer);}
     await rm(dir, {recursive:true, force:true});
   });
-  if (expectReady) assert.equal((await next()).method, 'test/ready');
-  return {dir, p, send, agent, next, received, exit, stderr:() => stderr};
+  let childArgs;
+  if (expectReady) {const ready = await next(); assert.equal(ready.method, 'test/ready'); childArgs = ready.params.args;}
+  return {dir, p, send, agent, next, received, exit, childArgs, stderr:() => stderr};
 }
+
+test('bridge loads a scoped system hook without rewriting ACP prompts or slash commands', {timeout:10_000}, async t => {
+  const f = await fixture(t);
+  assert.deepEqual(f.childArgs, ['--mod', join(process.cwd(),'acp-question-bridge/t3-guidance.mjs'), 'acp']);
+  const attached = rpc(1,'session/prompt',{sessionId:'a',prompt:[{type:'text',text:'Show this'}, {type:'image',mimeType:'image/png',data:'test'}], _meta:{test:'unchanged'}});
+  f.send(attached); assert.deepEqual(await f.received(),attached); f.agent(result(1)); await f.next();
+  f.send(prompt(2,'a','/cccompact')); assert.deepEqual(await f.received(),prompt(2,'a','/compact')); f.agent(result(2)); await f.next();
+  f.send(prompt(3,'a','after compaction')); assert.deepEqual(await f.received(),prompt(3,'a','after compaction')); f.agent(result(3)); await f.next();
+  f.send(prompt(4,'a','/bridge-status')); assert.match((await f.next()).params.update.content.text,/T3 system guidance: requested via --mod/); await f.next();
+});
+
+test('system guidance can be disabled without changing native ACP or question transport', {timeout:10_000}, async t => {
+  const f = await fixture(t,{COMMAND_CODE_BRIDGE_T3_GUIDANCE:'0'});
+  assert.deepEqual(f.childArgs,['acp']);
+  f.agent(q(1)); const form = await f.next();
+  f.send(result(form.id,{action:'accept',content:{answer:'B'}}));
+  assert.equal((await f.received()).result.outcome.optionId,'option_1');
+  f.send(prompt(2,'a','/bridge-status')); assert.match((await f.next()).params.update.content.text,/T3 system guidance: disabled/); await f.next();
+});
+
+test('guidance hook is stable across rounds, compacted/resumed states and sessions without mutating them', () => {
+  const hooks = [];
+  t3Guidance({hooks: value => hooks.push(value)});
+  assert.deepEqual(Object.keys(hooks[0]),['appendSystemPrompt']);
+  for (const state of [{sessionId:'a',messages:[]}, {sessionId:'a',messages:[{role:'user',content:'compacted summary'}]}, {sessionId:'b',messages:[]}]) {
+    const before = structuredClone(state);
+    for (let i=0;i<3;i++) assert.equal(hooks[0].appendSystemPrompt({state}),T3_GUIDANCE);
+    assert.deepEqual(state,before);
+  }
+  assert.match(T3_GUIDANCE,/call html_render directly/);
+  assert.match(T3_GUIDANCE,/Cancellation, dismissal, an empty result/);
+  assert.match(T3_GUIDANCE,/live schemas/);
+});
 
 async function crashReports(f) {
   const dir = join(f.dir, '.commandcode/acp-question-bridge/crashes');
@@ -97,7 +132,7 @@ test('native crash records bounded metadata, pending tools, exit status and code
   assert.ok((await f.next()).error); assert.notEqual((await f.exit).code,0);
   const reports = await crashReports(f); assert.equal(reports.length,1);
   const {path,report} = reports[0];
-  assert.equal(report.childExit.code,7); assert.equal(report.bridgeVersion,'2.0.3');
+  assert.equal(report.childExit.code,7); assert.equal(report.bridgeVersion,'2.0.4');
   assert.equal(report.requests[0].method,'session/prompt'); assert.equal(report.activeTools[0].kind,'execute');
   assert.equal(report.recentEvents.length,96); assert.ok(report.bridgeFrames.length);
   assert.equal(report.requests[0].session, report.activeTools[0].session);

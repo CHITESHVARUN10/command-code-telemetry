@@ -21,6 +21,7 @@
   },
   "scripts": {
     "test": "node --experimental-strip-types session-monitor.test.mjs && node --test acp-question-bridge/bridge.test.mjs",
-    "test:bridge-mcp": "node acp-question-bridge/mcp-loading.smoke.mjs"
+    "test:bridge-mcp": "node acp-question-bridge/mcp-loading.smoke.mjs",
+    "test:bridge-guidance": "node acp-question-bridge/guidance.smoke.mjs"
   }
 }

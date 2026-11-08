@@ -2,7 +2,15 @@
 
 The bridge runs the real `/usr/local/bin/cmd acp` and forwards normal prompts, thinking, tool calls, permissions, session management, and unknown ACP methods. It converts recognized Command Code questions to ACP elicitation forms so T3 asks the user even with full access. Only submitted answers select options. It is independent of the session monitor mod.
 
-T3's inline charts and interactive HTML use its existing `html_preview` and `html_render` MCP tools. T3 supplies their connection to Command Code through ACP; this bridge already forwards that configuration and the visual tool results. No separate visual server or runtime update is required for direct calls. Native Plan mode hides MCP tools. See [visual-tool investigation, verification limits, and test prompt](../docs/t3-visual-tools.md).
+T3's inline charts and interactive HTML use its existing `html_preview` and `html_render` MCP tools. T3 supplies their connection to Command Code through ACP; this bridge forwards that configuration and the visual tool results. Native Plan mode hides MCP tools. See [visual-tool investigation, verification limits, and test prompt](../docs/t3-visual-tools.md).
+
+## T3 system guidance (2.0.4)
+
+The companion [t3-guidance.mjs](./t3-guidance.mjs) registers only a native `appendSystemPrompt` hook. The bridge starts `cmd --mod <absolute-companion-path> acp`, so this mod is scoped to bridge processes and is not installed under the global mods directory. The hook appends a stable instruction block to every model round's system prompt. It does not add transcript messages or rewrite user text, attachments, commands, MCP descriptors, or answers. Compaction cannot discard it as an old conversation message.
+
+The instructions explain live tool discovery with `search_tools`, the normal qualified names, direct `html_preview` followed by `html_render`, existing-file HTML input, sizing and styling, and checking actual success before claiming a render. They discourage nested `codemode` visual calls because those lack the individual ACP event T3 uses for attachment projection. They also cover single-select question cards, submitted answers, cancellation, and native Plan-mode restrictions. Other T3 tools must be discovered from the actual catalog; no invented list or additional MCP server is supplied.
+
+Set `COMMAND_CODE_BRIDGE_T3_GUIDANCE=0` to omit the companion entirely; the transport and question adapter keep working. `/bridge-status` reports whether the load was requested. Native mod settings still apply: `mods.disableAll`, a disabled `t3-guidance` mod, or a name collision can prevent loading. Guidance cannot make a disconnected server or a hidden tool available, enforce model compliance, add general multi-select/custom answers, or guarantee Codex feature parity. Child agents have their own prompts/tool restrictions; do not assume they inherit the root's complete T3 capabilities.
 
 ## Commands
 
@@ -55,6 +63,7 @@ The report path is printed to stderr on failure and the directory appears in `/b
 | `COMMAND_CODE_BRIDGE_CANCEL_MS` | `5000` |
 | `COMMAND_CODE_BRIDGE_LOG` | `~/.commandcode/acp-question-bridge/diagnostics.ndjson`; empty disables logging |
 | `COMMAND_CODE_BRIDGE_CRASH_DIR` | `~/.commandcode/acp-question-bridge/crashes/`; empty disables failure reports |
+| `COMMAND_CODE_BRIDGE_T3_GUIDANCE` | Enabled; `0` disables the bridge-scoped system prompt companion |
 
 Configure these on the local ACP provider's process environment. New provider processes load new bridge code; replacing the file does not update or interrupt an existing process.
 
@@ -64,8 +73,10 @@ Command Code's current question transport accepts one option ID per question. Ge
 
 ## Install and rollback
 
-Copy `bridge.mjs` to `~/.commandcode/acp-question-bridge/bridge.mjs`, make it executable, and configure a separate local ACP provider with that absolute executable and no arguments. Keep the original Command Code provider available. For updates, save the installed file first and replace it atomically. Reconnect only when ready; active sessions retain the old code.
+Copy **both** `bridge.mjs` and `t3-guidance.mjs` to `~/.commandcode/acp-question-bridge/`, make `bridge.mjs` executable, and configure a separate local ACP provider with that absolute executable and no arguments. Keep the original Command Code provider available. For updates, back up both files, replace the companion first, then atomically replace the executable. Reconnect only when ready; active processes retain their loaded code.
 
-To roll back, restore that one bridge file from its backup and start a new provider process. To uninstall, remove the separate provider in T3 settings, then remove `~/.commandcode/acp-question-bridge/`. Do not restore a full settings backup over later settings changes. The original provider and session monitor mod are independent.
+To roll back a 2.0.4+ installation, restore both files from their matching backups and start a new provider process. To return to 2.0.3, restore only its executable; it ignores the unused companion, which can then be removed. To uninstall, remove the separate provider in T3 settings, then remove `~/.commandcode/acp-question-bridge/`. Do not restore a full settings backup over later settings changes. The original provider and session monitor mod are independent.
 
 Run tests with `node --test acp-question-bridge/bridge.test.mjs`, or `npm test` for both components.
+
+`npm run test:bridge-guidance` is opt-in and makes **two real model turns** using a fresh disposable native session. An isolated observer verifies the exact guidance appears once in the native system prompt before and after the `/compact` command; it records only boolean/count checks. The small session need not meet the native compaction threshold. This does not test rendering in T3. `npm run test:bridge-mcp` separately verifies real MCP discovery without model calls. Both close only their newly created sessions.

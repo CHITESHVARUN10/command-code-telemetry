@@ -6,9 +6,10 @@ import {randomUUID, createHash} from 'node:crypto';
 import {appendFileSync, mkdirSync, statSync, renameSync, realpathSync, openSync, readFileSync, closeSync, fstatSync, writeFileSync, readdirSync, unlinkSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join, dirname, resolve, relative, isAbsolute} from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 const executable = process.env.COMMAND_CODE_BINARY || '/usr/local/bin/cmd';
-const VERSION = '2.0.3';
+const VERSION = '2.0.4';
 const numberOption = (key, fallback) => {
   const value = Number(process.env[key]);
   return Number.isFinite(value) && value >= 0 && process.env[key] !== '' ? value : fallback;
@@ -29,7 +30,9 @@ function log(event, fields = {}) {
   } catch { /* Diagnostics must not break the transport. */ }
 }
 
-const child = spawn(executable, ['acp'], {stdio:['pipe','pipe','inherit'], env:process.env});
+const guidanceEnabled = process.env.COMMAND_CODE_BRIDGE_T3_GUIDANCE !== '0';
+const guidancePath = fileURLToPath(new URL('./t3-guidance.mjs', import.meta.url));
+const child = spawn(executable, [...guidanceEnabled ? ['--mod', guidancePath] : [], 'acp'], {stdio:['pipe','pipe','inherit'], env:process.env});
 const pending = new Map();
 const requests = new Map();
 const controls = new Map();
@@ -383,7 +386,7 @@ function clientMessage(m) {
       sendClient({jsonrpc:'2.0', id:m.id, result:{stopReason:'end_turn'}}); return;
     }
     if (text === '/bridge-status' && !s.native.has('bridge-status')) {
-      message(sessionId, `Command Code bridge ${VERSION}\nAgent messages: ${counters.fromAgent}\nThinking chunks forwarded: ${counters.thoughts}\nPending questions: ${pending.size}\nSilence limit: ${idleMs ? `${idleMs / 1000}s` : 'disabled'}\nFailure reports: ${crashDir || 'disabled'}\nNo tasks are automatically retried.`);
+      message(sessionId, `Command Code bridge ${VERSION}\nAgent messages: ${counters.fromAgent}\nThinking chunks forwarded: ${counters.thoughts}\nPending questions: ${pending.size}\nSilence limit: ${idleMs ? `${idleMs / 1000}s` : 'disabled'}\nT3 system guidance: ${guidanceEnabled ? 'requested via --mod (native mod settings still apply)' : 'disabled'}\nFailure reports: ${crashDir || 'disabled'}\nNo tasks are automatically retried.`);
       sendClient({jsonrpc:'2.0', id:m.id, result:{stopReason:'end_turn'}}); return;
     }
     if (text === '/cccompact' && !s.native.has('cccompact')) m = {...m, params:{...m.params, prompt:[{...prompt[0], text:'/compact'}]}};

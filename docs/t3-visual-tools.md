@@ -2,6 +2,8 @@
 
 Inspected on 2026-11-06 against the installed T3 application bundle, Command Code 1.88.2, and bridge 2.0.1. This is separate from the question-card adapter and the session monitor mod.
 
+Updated on 2026-11-08: bridge **2.0.4** adds [persistent system guidance](../acp-question-bridge/t3-guidance.mjs) for using the existing connection. T3's installed `t3AcpPromptWithInstructions` sends its ACP instructions inside the first user prompt and on tool/mode changes; unchanged subsequent turns skip them. Those transcript instructions can be summarized away. The new companion uses Command Code's documented [`appendSystemPrompt` hook](https://commandcode.ai/docs/mods), evaluated once per model round, without replacing the base system prompt or T3's own instructions. It supplies explicit discovery/rendering guidance even on later turns. Install both bridge files; no T3 source patch is needed.
+
 ## Result
 
 T3's inline charts, diagrams, and interactive HTML pages are provided by its `html_preview` and `html_render` MCP tools. They are not a GPT-only model capability. Models generate the HTML; T3 previews, stores, and displays it.
@@ -48,7 +50,7 @@ T3's bundled server is split across `runtimeLayer-*.mjs`, `ManagedEndpointRuntim
 - `acpMcpContext`: supplies server name `t3-code`, an `acp-mcp-bridge` stdio command, and thread-scoped endpoint/authorization environment variables. It also constructs optional HTTP/ACP transport descriptors.
 - `sessionMcpServers`: chooses an advertised supported transport, falling back to the stdio server descriptor. Generic local registry agents use that stdio path in the inspected build. Command Code advertises HTTP support, but T3's generic registry flavor does not enable its optional HTTP descriptor except for certain specific adapters.
 - `makeAcpRegistryRuntime`: forwards T3's MCP process environment to the local provider process.
-- `t3AcpPromptWithInstructions`: supplies T3's tool usage instructions to ACP agents, including the preview/render sequence. Its terminal MCP fallback exists, but is unnecessary when ordinary MCP discovery works.
+- `t3AcpPromptWithInstructions`: supplies T3's browser/orchestration guidance, including a short preview/render instruction, inside prompt text on first use and state changes. It does not persist that text in a native system-prompt hook or explain Command Code's qualified tool discovery and nested-call limitation. Its terminal MCP fallback exists, but direct MCP calls are preferable for inline visual projection.
 - `extractMcpToolCallIdentity`: recognizes qualified MCP names such as `mcp__t3-code__html_render` in ACP tool titles.
 - ACP dynamic-tool projection and `McpProviderSessions.takeHtmlRender`: associate successful render calls with their thread's stored HTML reference. This also supports providers whose ACP output lacks a typed `rawOutput` field.
 
@@ -79,9 +81,20 @@ To check the installed bridge file instead of the repository copy:
 node acp-question-bridge/mcp-loading.smoke.mjs "$HOME/.commandcode/acp-question-bridge/bridge.mjs"
 ```
 
-Local result: real Command Code 1.88.2 discovered both probe schemas through bridge 2.0.1. This proves real editor-MCP loading, not that DeepSeek selected the tools or that a real page rendered in the T3 UI. That final acceptance test needs the actual model/provider thread below. No new bridge installation is needed: the runtime file is unchanged.
+Earlier local result: real Command Code 1.88.2 discovered both probe schemas through bridge 2.0.1. This proves real editor-MCP loading, not that DeepSeek selected the tools or that a real page rendered in the T3 UI. That final acceptance test needs the actual model/provider thread below. Bridge 2.0.4 adds instructions; the MCP transport is unchanged.
+
+`npm run test:bridge-guidance` makes two real model turns in a fresh native session. It checks the composed system prompt contains the exact guidance once, before and after `/compact`, using a temporary observer that saves only presence/count flags. The small test may not trigger actual summarization. It does not inspect existing conversations or verify the T3 UI. Unit coverage separately checks stable hook output for empty, compacted, resumed, and independent session states, opt-out behavior, and unchanged wire prompts/commands. Native settings that disable user mods also disable this hook.
 
 ## DeepSeek acceptance prompt
+
+After installing 2.0.4 and reconnecting, first try an ordinary request without tool names:
+
+```text
+Show an interactive bar chart here in T3 Code: Apples 12, Oranges 8,
+Bananas 15. Add a count/percentage toggle. Do not modify project files.
+```
+
+The expected sequence is discovery as needed, an individual preview call, an individual render call, and a visible interactive chart. Then ask a separate single-select question, select a non-recommended answer, and verify the model reports that answer. A model's prose is not proof that either UI action occurred.
 
 Use a new or disposable T3 conversation with the bridge provider and DeepSeek selected. Choose a non-Plan mode. Paste:
 
