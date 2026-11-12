@@ -1,6 +1,7 @@
 // Loaded with --mod by this bridge only, never installed as a global user mod.
 // Keep these bytes stable: the hook is evaluated on every model round, including
 // after compaction. Live tool schemas and the user's instructions remain primary.
+import {writeSync} from 'node:fs';
 export const T3_GUIDANCE = `<t3_bridge_guidance version="1">
 You are running through the Command Code ACP bridge. When this session is hosted by T3 Code, T3 supplies its thread-scoped MCP server (normally named t3-code). Use its registered tools for native T3 features. This guidance describes how to use capabilities when available; it does not register tools or prove that a server connected. Follow the user's request and the current interaction mode.
 
@@ -25,5 +26,11 @@ If a tool is absent after discovery or its connection fails, state that precisel
 </t3_bridge_guidance>`;
 
 export default function t3Guidance(cmd) {
+  // Native servePrompt publishes the addressed agent's fresh context usage after
+  // resolving a command. Do not read the mod host's globally bound harness here.
+  cmd.addCommand({name:'bridge-context-refresh', description:'Refresh native context usage without a model call', handler:()=>({message:''})});
+  // Native ACP does not advertise mod commands. Confirm actual registration on
+  // a dedicated inherited pipe; never guess availability or send a model turn.
+  if (process.env.COMMAND_CODE_BRIDGE_CONTROL_FD === '3') try { writeSync(3,'context-refresh-v1\n'); } catch {}
   cmd.hooks({appendSystemPrompt: () => T3_GUIDANCE});
 }

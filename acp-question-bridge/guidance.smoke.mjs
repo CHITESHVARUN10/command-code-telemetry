@@ -27,16 +27,17 @@ export default function(cmd) {
 await writeFile(wrapper, `#!/usr/bin/env node
 import {spawn} from 'node:child_process';
 const child=spawn(${JSON.stringify(process.env.COMMAND_CODE_BINARY || '/usr/local/bin/cmd')},
- ['--mod',${JSON.stringify(observer)},...process.argv.slice(2)],{stdio:'inherit',env:process.env});
+ ['--mod',${JSON.stringify(observer)},...process.argv.slice(2)],{stdio:['inherit','inherit','inherit',3],env:process.env});
 child.on('error',()=>{process.exitCode=1});
 child.on('close',(code,signal)=>{process.exitCode=code || (signal ? 1 : 0)});
 for(const signal of ['SIGINT','SIGTERM','SIGHUP'])process.on(signal,()=>child.kill(signal));
 `);
 await chmod(wrapper,0o755);
 const child=spawn(process.execPath,[bridge],{cwd:dir,stdio:['pipe','pipe','pipe'],env:{...process.env,
- COMMAND_CODE_BINARY:wrapper, COMMAND_CODE_BRIDGE_T3_GUIDANCE:'1', COMMAND_CODE_BRIDGE_IDLE_MS:'0',
+ COMMAND_CODE_BINARY:wrapper, T3CODE_THREAD_ID:'', COMMAND_CODE_BRIDGE_T3_GUIDANCE:'1', COMMAND_CODE_BRIDGE_IDLE_MS:'0',
  COMMAND_CODE_BRIDGE_LOG:'', COMMAND_CODE_BRIDGE_CRASH_DIR:''}});
 let seq=0, sessionId, closed=false;
+const textChunks=[];
 const pending=new Map();
 child.stderr.resume(); // Native output may contain sensitive details; never echo it.
 const completion=new Promise(resolve=>child.on('close',()=>{
@@ -46,13 +47,14 @@ const completion=new Promise(resolve=>child.on('close',()=>{
 }));
 createInterface({input:child.stdout}).on('line',line=>{
  const m=JSON.parse(line), entry=pending.get(m.id);
+ if(m.params?.update?.sessionUpdate==='agent_message_chunk')textChunks.push(m.params.update.content?.text??'');
  if(!entry)return;
  clearTimeout(entry.timer);pending.delete(m.id);
- if(m.error)entry.reject(new Error('Native request failed: JSON-RPC '+m.error.code));else entry.resolve(m.result);
+ if(m.error)entry.reject(new Error('Native request failed: '+entry.method+' JSON-RPC '+m.error.code));else entry.resolve(m.result);
 });
 const request=(method,params)=>new Promise((resolve,reject)=>{
  const id=++seq, timer=setTimeout(()=>{pending.delete(id);reject(new Error('Timed out: '+method));},60_000);
- pending.set(id,{resolve,reject,timer});
+ pending.set(id,{resolve,reject,timer,method});
  child.stdin.write(JSON.stringify({jsonrpc:'2.0',id,method,params})+'\n');
 });
 try {
@@ -66,9 +68,20 @@ try {
  const results=(await readFile(checks,'utf8')).trim().split('\n').map(line=>JSON.parse(line));
  assert.ok(results.length>=2,'Native system prompt observer did not run for both turns');
  assert.ok(results.every(r=>r.present && r.copies===1),'System guidance missing or duplicated');
+ // Only the newly created session: test disk-backed restoration and a context
+ // query before any post-restore model call. Then test a nonexistent UUID.
+ const saved=sessionId;
  await request('session/close',{sessionId});sessionId=undefined;
+ await request('session/resume',{cwd:dir,sessionId:saved,mcpServers:[]});sessionId=saved;
+ textChunks.length=0;
+ await request('session/prompt',{sessionId,prompt:[{type:'text',text:'/context'}]});
+ assert.match(textChunks.join(''),/Context \(refreshed from Command Code\)/);
+ await request('session/close',{sessionId});sessionId=undefined;
+ await assert.rejects(request('session/load',{cwd:dir,sessionId:'00000000-0000-4000-8000-000000000001',mcpServers:[]}));
+ await assert.rejects(request('session/new',{cwd:dir,mcpServers:[]}));
  console.log(JSON.stringify({ok:true,nativeVersion:initialized.agentInfo?.version,modelTurns:2,
-  systemChecks:results.length,guidanceCopies:1,scope:'Native system append before and after /compact; no T3 UI acceptance test'}));
+  systemChecks:results.length,guidanceCopies:1,restoredContextRefresh:true,missingSessionAndFallbackBlocked:true,
+  scope:'Fresh native session only; system append, /compact, disk resume, context refresh and failed-restore guard; no T3 UI acceptance test'}));
 } finally {
  if(sessionId&&!closed)await request('session/close',{sessionId}).catch(()=>{});
  child.stdin.end();

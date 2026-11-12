@@ -30,7 +30,7 @@ createInterface({input:process.stdin}).on('line', line => {
 
 const bridge = process.argv[2] ? resolve(process.argv[2]) : fileURLToPath(new URL('./bridge.mjs', import.meta.url));
 const child = spawn(process.execPath, [bridge], {cwd:dir,
-  env:{...process.env, COMMAND_CODE_BRIDGE_LOG:'', COMMAND_CODE_BRIDGE_IDLE_MS:'0'}, stdio:['pipe','pipe','pipe']});
+  env:{...process.env, T3CODE_THREAD_ID:'', COMMAND_CODE_BRIDGE_LOG:'', COMMAND_CODE_BRIDGE_IDLE_MS:'0'}, stdio:['pipe','pipe','pipe']});
 let seq = 0, stderr = '', sessionId, closed = false;
 const pending = new Map();
 const completion = new Promise(resolve => child.on('close', (code) => {

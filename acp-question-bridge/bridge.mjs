@@ -9,7 +9,7 @@ import {join, dirname, resolve, relative, isAbsolute} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const executable = process.env.COMMAND_CODE_BINARY || '/usr/local/bin/cmd';
-const VERSION = '2.0.4';
+const VERSION = '2.0.5';
 const numberOption = (key, fallback) => {
   const value = Number(process.env[key]);
   return Number.isFinite(value) && value >= 0 && process.env[key] !== '' ? value : fallback;
@@ -32,10 +32,35 @@ function log(event, fields = {}) {
 
 const guidanceEnabled = process.env.COMMAND_CODE_BRIDGE_T3_GUIDANCE !== '0';
 const guidancePath = fileURLToPath(new URL('./t3-guidance.mjs', import.meta.url));
-const child = spawn(executable, [...guidanceEnabled ? ['--mod', guidancePath] : [], 'acp'], {stdio:['pipe','pipe','inherit'], env:process.env});
+const child = spawn(executable, [...guidanceEnabled ? ['--mod', guidancePath] : [], 'acp'], {stdio:['pipe','pipe','inherit','pipe'], env:{...process.env,COMMAND_CODE_BRIDGE_CONTROL_FD:'3'}});
+let contextRefreshReady = false;
+const controlLines = createInterface({input:child.stdio[3], crlfDelay:Infinity});
+controlLines.on('line',line=>{if(line === 'context-refresh-v1') contextRefreshReady = true;});
+child.stdio[3].on('error',()=>{});
 const pending = new Map();
 const requests = new Map();
 const controls = new Map();
+const activationChecks = new Map();
+const failedActivations = new Set();
+const strictResume = process.env.COMMAND_CODE_BRIDGE_STRICT_RESUME !== '0';
+let canListSessions = false;
+const restoreGuardPath = process.env.T3CODE_THREAD_ID ? join(homedir(), '.commandcode/acp-question-bridge/restore-guards', createHash('sha256').update(process.env.T3CODE_THREAD_ID).digest('hex') + '.json') : null;
+let persistedRestoreFailure = false;
+if (strictResume && restoreGuardPath) try { persistedRestoreFailure = Boolean(JSON.parse(readFileSync(restoreGuardPath,'utf8')).blocked); } catch {}
+function restoreFailure(id) {
+  if (!restoreGuardPath || !strictResume) return;
+  // T3 restarts the bridge before falling back to session/new. Scope the guard
+  // to T3's explicit originating thread ID, never infer a thread from cwd.
+  persistedRestoreFailure = true;
+  try { mkdirSync(dirname(restoreGuardPath),{recursive:true,mode:0o700}); writeFileSync(restoreGuardPath,JSON.stringify({blocked:true,session:sessionKey(id),at:new Date().toISOString()}),{mode:0o600}); }
+  catch { log('restore_guard_write_failed'); }
+}
+function clearRestoreFailure() {
+  persistedRestoreFailure = false;
+  if (restoreGuardPath) try { unlinkSync(restoreGuardPath); } catch {}
+}
+// Stable hashes allow continuity checks across bridge restarts without raw IDs.
+const sessionKey = id => typeof id === 'string' ? createHash('sha256').update(id).digest('hex').slice(0,24) : null;
 const agentRequests = new Map();
 const sessions = new Map();
 const prefix = `cc-bridge-${randomUUID()}-`;
@@ -294,13 +319,33 @@ function answered(id, m) {
 
 function agentMessage(m) {
   counters.fromAgent++;
+  if (m.id !== undefined && activationChecks.has(m.id) && !m.method) {
+    const original = activationChecks.get(m.id); activationChecks.delete(m.id);
+    const entries = m.result?.sessions;
+    if (m.error || !Array.isArray(entries) || !entries.some(s=>s.sessionId === original.params.sessionId)) {
+      failedActivations.add(original.params.cwd);
+      restoreFailure(original.params.sessionId);
+      requests.delete(original.id);
+      log('session_restore_rejected', {session:sessionKey(original.params.sessionId), listFailed:Boolean(m.error) || !Array.isArray(entries)});
+      sendClient(errorResult(original.id, 'Bridge refused to restore: the native session could not be verified in this workspace. No replacement session was created. Check the original session in Command Code; start a separate fresh T3 conversation if desired.'));
+    } else sendAgent(original);
+    return;
+  }
   if (m.method === 'session/update') {
     const sessionId = m.params?.sessionId, u = m.params?.update;
     if (typeof sessionId === 'string' && u) {
       touch(sessionId);
       const s = state(sessionId);
       if (u.sessionUpdate === 'agent_thought_chunk') counters.thoughts++;
-      if (u.sessionUpdate === 'usage_update' && Number.isFinite(u.used) && u.used >= 0 && Number.isFinite(u.size) && u.size > 0) s.usage = {used:u.used, size:u.size};
+      if (u.sessionUpdate === 'agent_message_chunk' && active(sessionId)?.compaction && u.content?.type === 'text' && u.content.text === 'Nothing to compact yet.') {
+        u.content = {...u.content, text:u.content.text + '\n\nCommand Code returned the same message count. This does not prove the context is small: native compaction preserves recent user turns and may decline to summarize them. Use /context to refresh the reading for this native session.'};
+        log('compaction_unchanged_count', {session:sessionKey(sessionId)});
+      }
+      if (u.sessionUpdate === 'usage_update' && Number.isFinite(u.used) && u.used >= 0 && Number.isFinite(u.size) && u.size > 0) {
+        s.usage = {used:u.used, size:u.size};
+        const r = active(sessionId); if (r?.contextRefresh) r.freshUsage = s.usage;
+        log('context_usage', {session:sessionKey(sessionId), used:u.used, size:u.size});
+      }
       if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') observeTool(sessionId, u);
       if (u.sessionUpdate === 'available_commands_update' && Array.isArray(u.availableCommands)) {
         s.native = new Set(u.availableCommands.map(c => c.name));
@@ -334,11 +379,23 @@ function agentMessage(m) {
       return;
     }
     const request = requests.get(m.id);
+    if (request?.method === 'initialize') canListSessions = m.result?.agentCapabilities?.sessionCapabilities?.list != null;
+    if (request && ['session/new','session/load','session/resume'].includes(request.method)) {
+      const restored = request.method !== 'session/new';
+      if (restored && m.error) { failedActivations.add(request.cwd); restoreFailure(request.sessionId); }
+      log('session_activation', {method:request.method, session:sessionKey(m.result?.sessionId ?? request.sessionId), failed:Boolean(m.error), errorCode:m.error?.code});
+      if (!m.error) {
+        const id = m.result?.sessionId ?? request.sessionId;
+        state(id).activation = restored ? 'restored' : 'new';
+        if (restored) { failedActivations.delete(request.cwd); clearRestoreFailure(); }
+      }
+    }
     if (request?.method === 'initialize' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(m.result?.agentInfo?.version ?? '')) nativeVersion = m.result.agentInfo.version;
     if (request && m.error) failureReport('native_request_error');
     if (request?.method === 'session/prompt') {
       clearQuestions(request.sessionId);
       state(request.sessionId).tools.clear();
+      if (request.contextRefresh && !m.error) showContext(request.sessionId, request.freshUsage, true);
       if (request.feedback && !m.error && !request.cancelAt && m.result?.stopReason === 'end_turn') {
         const feedback = request.feedback;
         request.feedback = undefined; request.lastActivity = Date.now();
@@ -381,24 +438,38 @@ function clientMessage(m) {
     const text = Array.isArray(prompt) && prompt.length === 1 && prompt[0]?.type === 'text' && typeof prompt[0].text === 'string' ? prompt[0].text.trim() : '';
     const s = state(sessionId);
     if (text === '/context' && !s.native.has('context')) {
+      if (contextRefreshReady || s.native.has('bridge-context-refresh')) {
+        requests.set(m.id, {method:m.method, sessionId, lastActivity:Date.now(), contextRefresh:true});
+        sendAgent({...m, params:{...m.params, prompt:[{type:'text',text:'/bridge-context-refresh'}]}}); return;
+      }
       const r = s.usage;
-      message(sessionId, r ? `Context (last reported by Command Code)\n\nUsed: ${Math.round(r.used).toLocaleString()} tokens\nWindow: ${Math.round(r.size).toLocaleString()} tokens\nFree: ${Math.max(0, Math.round(r.size - r.used)).toLocaleString()} tokens\nFill: ${Math.min(100, Math.max(0, Math.round(r.used / r.size * 100)))}%\n\nThis is an ACP host reading, not the terminal /context analysis. It may be an estimate and may not immediately reflect compaction.` : 'No context usage has been reported for this session yet. Send a model request and try again.');
+      showContext(sessionId, r, false);
       sendClient({jsonrpc:'2.0', id:m.id, result:{stopReason:'end_turn'}}); return;
     }
     if (text === '/bridge-status' && !s.native.has('bridge-status')) {
-      message(sessionId, `Command Code bridge ${VERSION}\nAgent messages: ${counters.fromAgent}\nThinking chunks forwarded: ${counters.thoughts}\nPending questions: ${pending.size}\nSilence limit: ${idleMs ? `${idleMs / 1000}s` : 'disabled'}\nT3 system guidance: ${guidanceEnabled ? 'requested via --mod (native mod settings still apply)' : 'disabled'}\nFailure reports: ${crashDir || 'disabled'}\nNo tasks are automatically retried.`);
+      message(sessionId, `Command Code bridge ${VERSION}\nNative session: ${sessionId}\nSession attachment: ${s.activation ?? 'unobserved'}\nStrict resume: ${strictResume ? 'enabled' : 'disabled'}\nAgent messages: ${counters.fromAgent}\nThinking chunks forwarded: ${counters.thoughts}\nPending questions: ${pending.size}\nSilence limit: ${idleMs ? `${idleMs / 1000}s` : 'disabled'}\nT3 system guidance: ${guidanceEnabled ? 'requested via --mod (native mod settings still apply)' : 'disabled'}\nFailure reports: ${crashDir || 'disabled'}\nNo tasks are automatically retried.`);
       sendClient({jsonrpc:'2.0', id:m.id, result:{stopReason:'end_turn'}}); return;
     }
     if (text === '/cccompact' && !s.native.has('cccompact')) m = {...m, params:{...m.params, prompt:[{...prompt[0], text:'/compact'}]}};
-    requests.set(m.id, {method:m.method, sessionId, lastActivity:Date.now()});
+    requests.set(m.id, {method:m.method, sessionId, lastActivity:Date.now(), compaction:text === '/cccompact' || text === '/compact'});
     const plan = /^\/(plan|ccplan)(?:\s+([\s\S]*))?$/.exec(text);
     if (plan && !s.native.has(plan[1])) {
       const id = prefix + 'mode-' + ++seq;
       controls.set(id, {clientId:m.id, original:m, task:plan[2]?.trim()});
       sendAgent({jsonrpc:'2.0', id, method:'session/set_mode', params:{sessionId, modeId:'plan'}}); return;
     }
-    log('prompt_started', {compaction:text === '/cccompact' || text === '/compact'});
-  } else if (m.method && m.id !== undefined) requests.set(m.id, {method:m.method, sessionId, lastActivity:Date.now()});
+    log('prompt_started', {session:sessionKey(sessionId), compaction:text === '/cccompact' || text === '/compact'});
+  } else if (m.method && m.id !== undefined) requests.set(m.id, {method:m.method, sessionId, cwd:m.params?.cwd, lastActivity:Date.now()});
+  if (strictResume && m.method === 'session/new' && (persistedRestoreFailure || failedActivations.has(m.params?.cwd))) {
+    requests.delete(m.id);
+    sendClient(errorResult(m.id, 'Bridge blocked a new session after failed restoration in this workspace. Reconnect to restore the original session, or explicitly start a separate fresh conversation.')); return;
+  }
+  if (strictResume && canListSessions && !sessions.get(sessionId)?.activation && ['session/load','session/resume'].includes(m.method)) {
+    const id = prefix + 'verify-' + ++seq;
+    activationChecks.set(id,m);
+    let cwd = m.params?.cwd; try { cwd = realpathSync(cwd); } catch {}
+    sendAgent({jsonrpc:'2.0',id,method:'session/list',params:{cwd}}); return;
+  }
   if (m.method === 'session/cancel') {
     // Forward cancellation first so resolving an old question cannot resume the run.
     sendAgent(m); clearQuestions(sessionId);
@@ -408,6 +479,10 @@ function clientMessage(m) {
   }
   if (m.method === 'session/close') { clearQuestions(sessionId); }
   sendAgent(m);
+}
+
+function showContext(sessionId, r, fresh) {
+  message(sessionId, r ? `Context (${fresh ? 'refreshed from' : 'last reported by'} Command Code)\n\nNative session: ${sessionId}\nUsed: ${Math.round(r.used).toLocaleString()} tokens\nWindow: ${Math.round(r.size).toLocaleString()} tokens\nFree: ${Math.max(0, Math.round(r.size-r.used)).toLocaleString()} tokens\nFill: ${Math.min(100,Math.max(0,Math.round(r.used/r.size*100)))}%\n\nThis is native host context accounting, which may be estimated after resume or compaction. It is not a billing total or the terminal's detailed /context breakdown.${fresh ? '' : ' Refresh companion unavailable; this cached reading may be stale.'}` : 'No context usage has been reported for this session yet. A fresh native context reading is unavailable; no cached value was substituted.');
 }
 
 agentLines.on('line', line => {

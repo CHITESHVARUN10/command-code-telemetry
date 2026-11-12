@@ -14,6 +14,8 @@ This repository contains two independent components that can be used together:
 
 Bridge 2.0.3 adds [failure-only diagnostic reports](./acp-question-bridge/README.md#failure-only-reports-203). See the [research on other Command Code ACP adapters](./docs/acp-alternatives.md) for their failure-handling approaches and compatibility limits.
 
+Bridge 2.0.5 adds native context refresh and a strict restore guard to prevent missing-session loads from silently starting fresh history. `/bridge-status` identifies the native session; hashed lifecycle diagnostics track continuity across restarts. See [session continuity and limits](./acp-question-bridge/README.md#session-continuity-and-context-refresh-205). The bridge cannot replace Command Code's context estimator or recover missing history.
+
 Bridge 2.0.4 also loads [T3 system guidance](./acp-question-bridge/t3-guidance.mjs) through Command Code's native prompt hook. It teaches models to discover the actual T3 tools, preview and render inline HTML through direct MCP calls, and wait for submitted question answers. The guidance is appended on every model round, including after compaction; user prompts remain unchanged. Install both bridge files as shown below. This improves tool usage without granting missing capabilities or removing Plan-mode restrictions.
 
 - **Session monitor mod** ([session-monitor.ts](./session-monitor.ts)) loads inside Command Code. It provides telemetry, `/tokens`, `/con`, `/com`, and a best-effort plan review guardrail in terminal and ACP sessions.

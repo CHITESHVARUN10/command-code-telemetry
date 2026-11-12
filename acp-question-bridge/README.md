@@ -16,7 +16,7 @@ Set `COMMAND_CODE_BRIDGE_T3_GUIDANCE=0` to omit the companion entirely; the tran
 
 | Command | Behavior |
 | --- | --- |
-| `/context` | Last session usage received from Command Code. An estimate, potentially stale after compaction; not terminal `/context` analysis. |
+| `/context` | Refresh native context through the loaded companion, without a model call. If the companion is unavailable, explicitly label the cached reading. Native accounting may itself be estimated; this is not the terminal category breakdown. |
 | `/cccompact` | Native ACP `/compact`. T3 intercepts `/compact` itself before generic ACP providers receive it. |
 | `/plan <task>` or `/ccplan <task>` | Set native session mode to `plan`, wait for acknowledgement, then send the task. Mode errors never start the task. |
 | `/plan` or `/ccplan` | Set native plan mode without calling the model. For subsequent tasks, select Plan in T3 as well: T3 may reapply its selected mode on each new turn. |
@@ -63,6 +63,7 @@ The report path is printed to stderr on failure and the directory appears in `/b
 | `COMMAND_CODE_BRIDGE_CANCEL_MS` | `5000` |
 | `COMMAND_CODE_BRIDGE_LOG` | `~/.commandcode/acp-question-bridge/diagnostics.ndjson`; empty disables logging |
 | `COMMAND_CODE_BRIDGE_CRASH_DIR` | `~/.commandcode/acp-question-bridge/crashes/`; empty disables failure reports |
+| `COMMAND_CODE_BRIDGE_STRICT_RESUME` | Enabled; `0` restores native permissive resume/fallback behavior |
 | `COMMAND_CODE_BRIDGE_T3_GUIDANCE` | Enabled; `0` disables the bridge-scoped system prompt companion |
 
 Configure these on the local ACP provider's process environment. New provider processes load new bridge code; replacing the file does not update or interrupt an existing process.
@@ -80,3 +81,19 @@ To roll back a 2.0.4+ installation, restore both files from their matching backu
 Run tests with `node --test acp-question-bridge/bridge.test.mjs`, or `npm test` for both components.
 
 `npm run test:bridge-guidance` is opt-in and makes **two real model turns** using a fresh disposable native session. An isolated observer verifies the exact guidance appears once in the native system prompt before and after the `/compact` command; it records only boolean/count checks. The small session need not meet the native compaction threshold. This does not test rendering in T3. `npm run test:bridge-mcp` separately verifies real MCP discovery without model calls. Both close only their newly created sessions.
+
+## Session continuity and context refresh (2.0.5)
+
+Checked against T3 0.1.9 and Command Code 1.88.5. `/context` previously answered entirely from bridge memory, which is lost on restart and can be stale. The companion now registers a no-op native command; a dedicated inherited control pipe confirms registration (native ACP does not advertise mod commands). The bridge invokes that command for `/context`. Native ACP publishes the **addressed session's** current usage after command resolution, before the bridge formats the result. There is no model request, transcript append, or read from a global/latest session. If no fresh usage arrives, the bridge reports it unavailable rather than substituting an older reading. Disabled/missing companions retain an explicitly labeled cached fallback.
+
+The number is still Command Code's context accounting, not billing usage or terminal category analysis. After resume, Command Code reconstructs messages but does not restore the compaction mod's in-memory token basis; its context gate can therefore fall back to a message estimate. That can differ from an earlier model API input count. The bridge cannot certify the user's particular 800k-versus-28k discrepancy from the old logs.
+
+With strict resume enabled, the bridge checks a persisted session exists in native `session/list` for the canonical workspace before forwarding a disk load/resume. Sessions already attached in this process can reactivate without disk verification, including unpersisted empty sessions. A failed check or native restore error blocks subsequent `session/new` fallback for that workspace in this process. When T3 supplies `T3CODE_THREAD_ID`, a private hashed file under `~/.commandcode/acp-question-bridge/restore-guards/` preserves the failure guard across process restarts **for that T3 thread only**. Successful restoration clears it. Starting a separate conversation has a different thread ID. To deliberately accept native permissive behavior, set `COMMAND_CODE_BRIDGE_STRICT_RESUME=0` and reconnect. Do not delete the original session as a workaround.
+
+This is an existence guard, not validation of every transcript entry. It depends on advertised native session listing, writable guard storage for cross-process protection, and T3 supplying its originating thread ID. It cannot stop a T3 session replacement that happens without an observable restore attempt, or fix an existing corrupt transcript. It never chooses a session by newest file, rewrites native IDs, retries a task, or attaches an old session to a different thread.
+
+`/bridge-status` now shows the addressed native ID and whether this process observed a new or restored attachment. Lifecycle diagnostics record successful/failed activations and context counts using stable one-way session hashes, so later reconnects can be correlated without recording prompts, answers, IDs, paths, or credentials.
+
+Native `compactSession` reports "Nothing to compact yet" when the before/after **message counts** match. Recent user turns are preserved by the summarizer and may be very large; unchanged counts do not prove low context or distinguish every native outcome. The bridge adds that explanation to the exact native no-change message; it does not force more aggressive summarization or fabricate tokens saved. T3's own `/compact` routing remains outside this alias; use `/cccompact` to address native compaction through the bridge.
+
+The opt-in native guidance smoke now also closes and restores its own newly created session, checks `/context` before another model call, and verifies that a nonexistent session and fresh fallback are rejected. It makes two real model turns and never accesses an existing user session.

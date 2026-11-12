@@ -44,7 +44,7 @@ createInterface({input:process.stdin}).on('line', line => {
   const p = spawn(process.execPath, ['acp-question-bridge/bridge.mjs'], {
     env:{...process.env, HOME:dir, COMMAND_CODE_BINARY:esmFake, COMMAND_CODE_BRIDGE_LOG:join(dir, 'diagnostics.ndjson'),
       COMMAND_CODE_BRIDGE_CRASH_DIR:join(dir,'.commandcode/acp-question-bridge/crashes'),
-      COMMAND_CODE_BRIDGE_IDLE_MS:'0', COMMAND_CODE_BRIDGE_T3_GUIDANCE:'1', ...options}, stdio:['pipe','pipe','pipe']});
+      COMMAND_CODE_BRIDGE_IDLE_MS:'0', COMMAND_CODE_BRIDGE_T3_GUIDANCE:'1', T3CODE_THREAD_ID:'', ...options}, stdio:['pipe','pipe','pipe']});
   let stderr = '', wake, closed = false;
   const queue = [];
   p.stderr.on('data', d => {stderr += d});
@@ -94,7 +94,7 @@ test('system guidance can be disabled without changing native ACP or question tr
 
 test('guidance hook is stable across rounds, compacted/resumed states and sessions without mutating them', () => {
   const hooks = [];
-  t3Guidance({hooks: value => hooks.push(value)});
+  t3Guidance({hooks: value => hooks.push(value), addCommand: () => {}});
   assert.deepEqual(Object.keys(hooks[0]),['appendSystemPrompt']);
   for (const state of [{sessionId:'a',messages:[]}, {sessionId:'a',messages:[{role:'user',content:'compacted summary'}]}, {sessionId:'b',messages:[]}]) {
     const before = structuredClone(state);
@@ -111,6 +111,66 @@ async function crashReports(f) {
   const names = await readdir(dir).catch(error => {if (error.code === 'ENOENT') return []; throw error;});
   return Promise.all(names.filter(n=>n.endsWith('.json')).map(async name=>({path:join(dir,name), report:JSON.parse(await readFile(join(dir,name),'utf8'))})));
 }
+
+test('context refresh addresses native session and never substitutes stale usage when none arrives', {timeout:10_000}, async t=>{
+  const f=await fixture(t);
+  f.agent(update('a',{sessionUpdate:'available_commands_update',availableCommands:[{name:'bridge-context-refresh'}]})); await f.next();
+  f.agent(update('a',{sessionUpdate:'usage_update',used:800000,size:1000000}));await f.next();
+  f.send(prompt(1,'a','/context'));assert.deepEqual(await f.received(),prompt(1,'a','/bridge-context-refresh'));
+  f.agent(update('b',{sessionUpdate:'usage_update',used:12,size:1000000}));await f.next();
+  f.agent(update('a',{sessionUpdate:'usage_update',used:28000,size:1000000}));await f.next();
+  f.agent(result(1));assert.match((await f.next()).params.update.content.text,/refreshed from[\s\S]*28,000/);assert.equal((await f.next()).id,1);
+  f.send(prompt(2,'a','/context'));await f.received();f.agent(result(2));
+  assert.match((await f.next()).params.update.content.text,/no cached value was substituted/);await f.next();
+});
+
+test('resume is verified, missing sessions fail closed and fresh fallback is blocked', {timeout:10_000}, async t=>{
+  const f=await fixture(t);
+  f.send(rpc(1,'initialize',{}));await f.received();
+  f.agent(result(1,{agentCapabilities:{sessionCapabilities:{list:{}}}}));await f.next();
+  const load=rpc(2,'session/load',{cwd:'/tmp/project',sessionId:'private-native-id',mcpServers:[]});
+  f.send(load);const check=await f.received();assert.equal(check.method,'session/list');
+  f.agent(result(check.id,{sessions:[]}));assert.match((await f.next()).error.message,/could not be verified/);
+  f.send(rpc(3,'session/new',{cwd:'/tmp/project',mcpServers:[]}));assert.match((await f.next()).error.message,/blocked a new session/);
+  f.send({...load,id:4});const retry=await f.received();
+  f.agent(result(retry.id,{sessions:[{sessionId:'private-native-id'}]}));assert.deepEqual(await f.received(),{...load,id:4});
+  f.agent(result(4,{}));await f.next();
+  f.send(prompt(5,'private-native-id','/bridge-status'));assert.match((await f.next()).params.update.content.text,/Session attachment: restored/);await f.next();
+  const log=await readFile(join(f.dir,'diagnostics.ndjson'),'utf8');assert.ok(!log.includes('private-native-id'));assert.match(log,/session_restore_rejected/);
+});
+
+test('failed native restore blocks fallback; same-process empty sessions can reactivate and strict guard has opt-out', {timeout:10_000}, async t=>{
+  const f=await fixture(t);
+  f.send(rpc(1,'session/load',{cwd:'/tmp/p',sessionId:'a'}));await f.received();
+  f.agent({jsonrpc:'2.0',id:1,error:{code:-32603,message:'not found'}});await f.next();
+  f.send(rpc(2,'session/new',{cwd:'/tmp/p'}));assert.match((await f.next()).error.message,/blocked/);
+  f.send(rpc(3,'session/new',{cwd:'/tmp/other'}));await f.received();f.agent(result(3,{sessionId:'b'}));await f.next();
+  f.send(rpc(4,'initialize',{}));await f.received();f.agent(result(4,{agentCapabilities:{sessionCapabilities:{list:{}}}}));await f.next();
+  f.send(rpc(5,'session/resume',{cwd:'/tmp/other',sessionId:'b'}));assert.equal((await f.received()).method,'session/resume');
+  const g=await fixture(t,{COMMAND_CODE_BRIDGE_STRICT_RESUME:'0'});
+  g.send(rpc(1,'session/load',{cwd:'/tmp/p',sessionId:'a'}));await g.received();g.agent({jsonrpc:'2.0',id:1,error:{code:-32603,message:'missing'}});await g.next();
+  g.send(rpc(2,'session/new',{cwd:'/tmp/p'}));assert.equal((await g.received()).method,'session/new');
+});
+
+test('failed restore guard survives bridge restart for the same T3 thread only and clears on successful restore', {timeout:10_000}, async t=>{
+  const f=await fixture(t,{T3CODE_THREAD_ID:'private-thread'});
+  f.send(rpc(1,'session/load',{cwd:'/tmp/p',sessionId:'private-session'}));await f.received();f.agent({jsonrpc:'2.0',id:1,error:{code:-32603,message:'missing'}});await f.next();
+  f.p.stdin.end();await f.exit;
+  const g=await fixture(t,{HOME:f.dir,T3CODE_THREAD_ID:'private-thread'});
+  g.send(rpc(1,'session/new',{cwd:'/tmp/p'}));assert.match((await g.next()).error.message,/blocked/);
+  const h=await fixture(t,{HOME:f.dir,T3CODE_THREAD_ID:'another-thread'});
+  h.send(rpc(1,'session/new',{cwd:'/tmp/p'}));assert.equal((await h.received()).method,'session/new');
+  g.send(rpc(2,'session/load',{cwd:'/tmp/p',sessionId:'private-session'}));await g.received();g.agent(result(2,{}));await g.next();
+  g.send(rpc(3,'session/new',{cwd:'/tmp/p'}));assert.equal((await g.received()).method,'session/new');
+});
+
+test('unchanged native compaction count is explained without inventing success or changing session', {timeout:10_000}, async t=>{
+  const f=await fixture(t);
+  f.send(prompt(1,'a','/cccompact'));assert.deepEqual(await f.received(),prompt(1,'a','/compact'));
+  f.agent(update('a',{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Nothing to compact yet.'}}));
+  assert.match((await f.next()).params.update.content.text,/does not prove the context is small/);
+  f.agent(result(1));assert.equal((await f.next()).id,1);
+});
 
 test('failure recorder stays memory-only during normal work and client teardown', {timeout:10_000}, async t => {
   const f = await fixture(t);
@@ -132,7 +192,7 @@ test('native crash records bounded metadata, pending tools, exit status and code
   assert.ok((await f.next()).error); assert.notEqual((await f.exit).code,0);
   const reports = await crashReports(f); assert.equal(reports.length,1);
   const {path,report} = reports[0];
-  assert.equal(report.childExit.code,7); assert.equal(report.bridgeVersion,'2.0.4');
+  assert.equal(report.childExit.code,7); assert.equal(report.bridgeVersion,'2.0.5');
   assert.equal(report.requests[0].method,'session/prompt'); assert.equal(report.activeTools[0].kind,'execute');
   assert.equal(report.recentEvents.length,96); assert.ok(report.bridgeFrames.length);
   assert.equal(report.requests[0].session, report.activeTools[0].session);
